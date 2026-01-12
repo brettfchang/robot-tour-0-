@@ -33,8 +33,8 @@ const float MM_PER_COUNT = (PI * WHEEL_DIAMETER_MM) / COUNTS_PER_REV;
 const unsigned long LOOP_PERIOD_US = 20000;  // 50Hz
 
 // Velocity PID gains (inner loop - controls PWM to achieve target velocity)
-float Kp_vel = 4.0;
-float Ki_vel = 0.4;
+float Kp_vel = 0.08;
+float Ki_vel = 0.0;
 float Kd_vel = 0.0;
 const float MAX_VELOCITY = 300.0;  // mm/s max speed
 
@@ -210,8 +210,9 @@ void updateOdometry(float dt) {
   float distRight = deltaRight * MM_PER_COUNT;
 
   // Calculate wheel velocities (mm/s)
+  // Note: distRight sign is inverted from encoder, flip it back for velocity feedback
   velLeft = distLeft / dt;
-  velRight = distRight / dt;
+  velRight = -distRight / dt;
 
   float distCenter = (distLeft + distRight) / 2.0;
 
@@ -286,6 +287,9 @@ void enableMotors(bool en) {
 void driveRaw(int pwmL, int pwmR) {
   pwmL = constrain(pwmL, -255, 255);
   pwmR = constrain(pwmR, -255, 255);
+
+  // Flip right motor direction
+  pwmR = -pwmR;
 
   if (pwmL < 0) {
     digitalWrite(AIN1_PIN, LOW);
