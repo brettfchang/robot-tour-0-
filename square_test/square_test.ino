@@ -1,7 +1,13 @@
 // Square Test: Button 4 runs a 500mm square (right turns)
 // Forward 500, turn 90 right, x4
+// Uses MPU6050 gyro for heading
+
+#include <Wire.h>
 
 // ============== CONFIGURATION ==============
+
+// MPU6050 I2C address
+const int MPU6050_ADDR = 0x68;
 
 // Motor pins
 const int PWMA_PIN = 11;
@@ -56,7 +62,11 @@ long encRightPrev = 0;
 // Measured odometry
 float posX = 0;
 float posY = 0;
-float heading = 0;
+float heading = 0;        // Now from gyro!
+float headingEncoder = 0; // Encoder-based heading (backup/comparison)
+
+// Gyro calibration
+float gyroBiasZ = 0;
 
 // Expected position (ideal path)
 float expectedX = 0;
@@ -123,6 +133,61 @@ void readEncoders(long &left, long &right) {
   interrupts();
 }
 
+// ============== MPU6050 GYRO ==============
+
+void setupMPU6050() {
+  Wire.begin();
+
+  // Wake up MPU6050
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B);  // PWR_MGMT_1 register
+  Wire.write(0x00);  // Wake up
+  Wire.endTransmission();
+
+  // Set gyro range to ±250°/s (most sensitive)
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1B);  // GYRO_CONFIG register
+  Wire.write(0x00);  // ±250°/s
+  Wire.endTransmission();
+
+  // Set low pass filter to 44Hz (reduces noise)
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1A);  // CONFIG register
+  Wire.write(0x03);  // DLPF_CFG = 3 (44Hz)
+  Wire.endTransmission();
+
+  delay(100);
+
+  // Calibrate gyro bias (robot must be stationary!)
+  Serial.println("Calibrating gyro... keep robot still!");
+  long sum = 0;
+  const int samples = 500;
+  for (int i = 0; i < samples; i++) {
+    sum += readGyroZRaw();
+    delay(2);
+  }
+  gyroBiasZ = (float)sum / samples;
+  Serial.print("Gyro bias: ");
+  Serial.println(gyroBiasZ);
+}
+
+int16_t readGyroZRaw() {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x47);  // GYRO_ZOUT_H register
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 2, true);
+
+  int16_t gyroZ = Wire.read() << 8 | Wire.read();
+  return gyroZ;
+}
+
+float readGyroZ() {
+  // Returns angular velocity in rad/s (inverted)
+  int16_t raw = readGyroZRaw();
+  float gyroZ = -(raw - gyroBiasZ) / 131.0;  // 131 LSB/(°/s) for ±250°/s range (inverted)
+  return gyroZ * PI / 180.0;  // Convert to rad/s
+}
+
 // ============== ODOMETRY ==============
 
 void updateOdometry(float dt) {
@@ -138,15 +203,25 @@ void updateOdometry(float dt) {
   float distRight = deltaRight * MM_PER_COUNT;
 
   float distCenter = (distLeft + distRight) / 2.0;
-  float deltaHeading = (distRight - distLeft) / WHEEL_BASE_MM;
 
-  float midHeading = heading + deltaHeading / 2.0;
+  // Encoder-based heading (for comparison)
+  float deltaHeadingEnc = (distRight - distLeft) / WHEEL_BASE_MM;
+  headingEncoder += deltaHeadingEnc;
+
+  // Gyro-based heading (primary)
+  float gyroZ = readGyroZ();  // rad/s
+  heading += gyroZ * dt;
+
+  // Use gyro heading for position calculation
+  float midHeading = heading - (gyroZ * dt) / 2.0;
   posX += distCenter * cos(midHeading);
   posY += distCenter * sin(midHeading);
-  heading += deltaHeading;
 
+  // Normalize headings
   while (heading > PI) heading -= 2 * PI;
   while (heading < -PI) heading += 2 * PI;
+  while (headingEncoder > PI) headingEncoder -= 2 * PI;
+  while (headingEncoder < -PI) headingEncoder += 2 * PI;
 }
 
 void resetOdometry() {
@@ -159,6 +234,7 @@ void resetOdometry() {
   posX = 0;
   posY = 0;
   heading = 0;
+  headingEncoder = 0;
   expectedX = 0;
   expectedY = 0;
   expectedHeading = 0;
@@ -244,6 +320,10 @@ bool driveStraight(float distanceMm) {
   bool goingBackward = (distanceMm < 0);
   float totalDist = abs(distanceMm);
 
+  // Track starting position for distance traveled
+  float startX = posX;
+  float startY = posY;
+
   resetPID(pidPos);
   resetPID(pidHeading);
 
@@ -265,10 +345,16 @@ bool driveStraight(float distanceMm) {
 
       updateOdometry(dt);
 
+      // Distance traveled from start
+      float distTraveled = sqrt((posX - startX) * (posX - startX) + (posY - startY) * (posY - startY));
+
+      // Distance error = how much further to go (based on travel, not Euclidean to target)
+      float distError = totalDist - distTraveled;
+      if (distError < 0) distError = 0;
+
+      // Angle to target (still used for heading correction direction)
       float dx = targetX - posX;
       float dy = targetY - posY;
-      float distError = sqrt(dx * dx + dy * dy);
-
       float angleToTarget = atan2(dy, dx);
 
       float headingError;
@@ -280,8 +366,8 @@ bool driveStraight(float distanceMm) {
       while (headingError > PI) headingError -= 2 * PI;
       while (headingError < -PI) headingError += 2 * PI;
 
-      // Heading correction fades out linearly: full at start, 0 at end
-      float progress = 1.0 - (distError / totalDist);  // 0 at start, 1 at end
+      // Heading correction fades out based on distance traveled
+      float progress = distTraveled / totalDist;  // 0 at start, 1 when traveled full distance
       progress = constrain(progress, 0.0, 1.0);
       float headingCorrectionScale = 1.0 - progress;
 
@@ -421,9 +507,11 @@ void printOdometry() {
   Serial.print(posX);
   Serial.print(" Y: ");
   Serial.print(posY);
-  Serial.print(" Heading: ");
+  Serial.print(" Hdg(gyro): ");
   Serial.print(heading * 180.0 / PI);
-  Serial.print(" deg (exp: ");
+  Serial.print(" Hdg(enc): ");
+  Serial.print(headingEncoder * 180.0 / PI);
+  Serial.print(" (exp: ");
   Serial.print(expectedX);
   Serial.print(", ");
   Serial.print(expectedY);
@@ -474,12 +562,13 @@ void setup() {
   pinMode(STBY_PIN, OUTPUT);
 
   setupEncoders();
+  setupMPU6050();
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   enableMotors(false);
 
-  Serial.println("Square Test");
+  Serial.println("Square Test (Gyro heading)");
   Serial.println("Press button 4 to run 500mm square (right turns)");
 }
 
