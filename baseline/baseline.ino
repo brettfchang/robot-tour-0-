@@ -37,10 +37,13 @@ float Kp_pos = 10.0;
 float Ki_pos = 0.0;
 float Kd_pos = 0.5;
 
-// Heading PID (for keeping straight and turning)
+// Heading PID (for turning)
 float Kp_heading = 150.0;
-float Ki_heading = 0.0;
+float Ki_heading = 1.0;
 float Kd_heading = 5.0;
+
+// Heading correction during straights (can be different)
+float Kp_heading_straight = 1000.0;
 
 // Motion limits
 const int MAX_PWM = 255;          // Max speed
@@ -60,10 +63,15 @@ volatile long encRight = 0;
 long encLeftPrev = 0;
 long encRightPrev = 0;
 
-// Odometry state
+// Odometry state (measured)
 float posX = 0;       // mm
 float posY = 0;       // mm
 float heading = 0;    // radians
+
+// Expected position (ideal path)
+float expectedX = 0;
+float expectedY = 0;
+float expectedHeading = 0;
 
 // Timing
 unsigned long lastUpdateUs = 0;
@@ -188,6 +196,9 @@ void resetOdometry() {
   posX = 0;
   posY = 0;
   heading = 0;
+  expectedX = 0;
+  expectedY = 0;
+  expectedHeading = 0;
 }
 
 // ============== PID CONTROLLER ==============
@@ -274,9 +285,9 @@ void brake() {
 // Drive straight for a given distance (mm)
 // Positive = forward, negative = backward
 bool driveStraight(float distanceMm) {
-  // Calculate target position
-  float targetX = posX + distanceMm * cos(heading);
-  float targetY = posY + distanceMm * sin(heading);
+  // Calculate target from EXPECTED position (ideal path)
+  float targetX = expectedX + distanceMm * cos(expectedHeading);
+  float targetY = expectedY + distanceMm * sin(expectedHeading);
   bool goingBackward = (distanceMm < 0);
 
   resetPID(pidPos);
@@ -326,7 +337,7 @@ bool driveStraight(float distanceMm) {
       // Compute PID outputs
       float baseSpeed = computePID(distError, 0, Kp_pos, Ki_pos, Kd_pos,
                                    pidPos, dt, MAX_PWM);
-      float turnCorrection = computePID(headingError, 0, Kp_heading, Ki_heading, Kd_heading,
+      float turnCorrection = computePID(headingError, 0, Kp_heading_straight, Ki_heading, Kd_heading,
                                         pidHeading, dt, MAX_PWM / 2);
 
       // Limit base speed
@@ -363,6 +374,9 @@ bool driveStraight(float distanceMm) {
         settleCount++;
         if (settleCount >= SETTLE_COUNT) {
           brake();
+          // Update expected position to target
+          expectedX = targetX;
+          expectedY = targetY;
           Serial.println("Done - settled");
           return true;
         }
@@ -373,6 +387,9 @@ bool driveStraight(float distanceMm) {
       // Timeout check
       if (millis() - startTime > TIMEOUT_MS) {
         brake();
+        // Still update expected position (assume we made it)
+        expectedX = targetX;
+        expectedY = targetY;
         Serial.println("Done - timeout");
         return false;
       }
@@ -384,7 +401,8 @@ bool driveStraight(float distanceMm) {
 // Positive = counter-clockwise, negative = clockwise
 bool turn(float degrees) {
   float radians = degrees * PI / 180.0;
-  float targetHeading = heading + radians;
+  // Calculate target from EXPECTED heading (ideal path)
+  float targetHeading = expectedHeading + radians;
 
   // Normalize target
   while (targetHeading > PI) targetHeading -= 2 * PI;
@@ -447,6 +465,8 @@ bool turn(float degrees) {
         settleCount++;
         if (settleCount >= SETTLE_COUNT) {
           brake();
+          // Update expected heading to target
+          expectedHeading = targetHeading;
           Serial.println("Done - settled");
           return true;
         }
@@ -457,6 +477,8 @@ bool turn(float degrees) {
       // Timeout check
       if (millis() - startTime > TIMEOUT_MS) {
         brake();
+        // Still update expected heading (assume we made it)
+        expectedHeading = targetHeading;
         Serial.println("Done - timeout");
         return false;
       }
@@ -473,7 +495,13 @@ void printOdometry() {
   Serial.print(posY);
   Serial.print(" Heading: ");
   Serial.print(heading * 180.0 / PI);
-  Serial.println(" deg");
+  Serial.print(" deg (exp: ");
+  Serial.print(expectedX);
+  Serial.print(", ");
+  Serial.print(expectedY);
+  Serial.print(", ");
+  Serial.print(expectedHeading * 180.0 / PI);
+  Serial.println(")");
 }
 
 // ============== TEST SEQUENCE ==============
