@@ -426,7 +426,7 @@ if (millis() - start_time > TIMEOUT_MS) {
 
 ---
 
-## 7. Code Structure
+## 8. Code Structure
 
 ```
 robot-tour.ino
@@ -444,7 +444,7 @@ robot-tour.ino
 
 ---
 
-## 8. Measurements Needed
+## 9. Measurements Needed
 
 - [ ] Wheel diameter (mm)
 - [ ] Wheel base / distance between wheel centers (mm)
@@ -454,7 +454,7 @@ robot-tour.ino
 
 ---
 
-## 9. Testing & Tuning Order
+## 10. Testing & Tuning Order
 
 ### Phase 1: Verify Hardware
 1. **Verify encoders** - print raw counts, ensure both work and count correctly
@@ -479,14 +479,20 @@ robot-tour.ino
 14. **Add heading D** - for clean stops without oscillation
 15. **Verify turn accuracy** - both directions
 
-### Phase 5: Integration
-16. **Test sequences** - multiple moves, verify error correction
-17. **Fine-tune tolerances** - balance precision vs. completion time
-18. **Add I terms** - only if persistent steady-state error remains
+### Phase 5: Calibrate Load Detection
+16. **Run empty** - log avg PWM/velocity → set LOAD_FACTOR_EMPTY
+17. **Run with bottle** - log avg PWM/velocity → set LOAD_FACTOR_LOADED
+18. **Tune max velocities** - adjust MAX_VEL_EMPTY and MAX_VEL_LOADED
+
+### Phase 6: Integration
+19. **Test sequences** - multiple moves, verify error correction
+20. **Test with pickup/dropoff** - verify adaptive velocity works
+21. **Fine-tune tolerances** - balance precision vs. completion time
+22. **Add I terms** - only if persistent steady-state error remains
 
 ---
 
-## 10. Potential Improvements (Future)
+## 11. Potential Improvements (Future)
 
 - **Trapezoidal velocity profile** - ramp up/down speed for smoother motion
 - **Feedforward control** - estimate base PWM from known motor characteristics
