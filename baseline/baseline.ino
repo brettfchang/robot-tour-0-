@@ -207,12 +207,11 @@ float computePID(float error, float measurement, float Kp, float Ki, float Kd,
   state.integral = constrain(state.integral, -maxIntegral, maxIntegral);
   float I = state.integral;
 
-  // Derivative on measurement (not error) to avoid derivative kick
-  float derivative = -(measurement - state.lastMeasurement) / dt;
+  // Derivative on error (filtered)
+  float derivative = (error - state.lastError) / dt;
   // Simple low-pass filter (alpha = 0.3 for more smoothing)
-  static float derivFiltered = 0;
-  derivFiltered = 0.3 * derivative + 0.7 * derivFiltered;
-  float D = Kd * derivFiltered;
+  state.derivFiltered = 0.3 * derivative + 0.7 * state.derivFiltered;
+  float D = -Kd * state.derivFiltered;  // Negative for damping
 
   state.lastError = error;
   state.lastMeasurement = measurement;
@@ -276,6 +275,7 @@ bool driveStraight(float distanceMm) {
   // Calculate target position
   float targetX = posX + distanceMm * cos(heading);
   float targetY = posY + distanceMm * sin(heading);
+  bool goingBackward = (distanceMm < 0);
 
   resetPID(pidPos);
   resetPID(pidHeading);
@@ -288,7 +288,8 @@ bool driveStraight(float distanceMm) {
   Serial.print("Driving to: ");
   Serial.print(targetX);
   Serial.print(", ");
-  Serial.println(targetY);
+  Serial.print(targetY);
+  Serial.println(goingBackward ? " (backward)" : " (forward)");
 
   while (true) {
     unsigned long now = micros();
@@ -308,7 +309,14 @@ bool driveStraight(float distanceMm) {
       float angleToTarget = atan2(dy, dx);
 
       // Heading error - steer toward target
-      float headingError = angleToTarget - heading;
+      float headingError;
+      if (goingBackward) {
+        // When going backward, we want our BACK to face the target
+        // So desired heading is angleToTarget + 180°
+        headingError = angleToTarget + PI - heading;
+      } else {
+        headingError = angleToTarget - heading;
+      }
       // Normalize to [-PI, PI]
       while (headingError > PI) headingError -= 2 * PI;
       while (headingError < -PI) headingError += 2 * PI;
@@ -316,15 +324,20 @@ bool driveStraight(float distanceMm) {
       // Compute PID outputs
       float baseSpeed = computePID(distError, 0, Kp_pos, Ki_pos, Kd_pos,
                                    pidPos, dt, MAX_PWM);
-      float turnCorrection = computePID(headingError, heading, Kp_heading, Ki_heading, Kd_heading,
+      float turnCorrection = computePID(headingError, 0, Kp_heading, Ki_heading, Kd_heading,
                                         pidHeading, dt, MAX_PWM / 2);
 
       // Limit base speed
       baseSpeed = constrain(baseSpeed, -MAX_PWM, MAX_PWM);
 
-      // Calculate motor powers
-      int powerL = (int)(baseSpeed + turnCorrection);
-      int powerR = (int)(baseSpeed - turnCorrection);
+      // If going backward, negate base speed
+      if (goingBackward) {
+        baseSpeed = -baseSpeed;
+      }
+
+      // Calculate motor powers (constrain to valid PWM range)
+      int powerL = constrain((int)(baseSpeed + turnCorrection), -255, 255);
+      int powerR = constrain((int)(baseSpeed - turnCorrection), -255, 255);
 
       drive(powerL, powerR);
 
@@ -340,6 +353,7 @@ bool driveStraight(float distanceMm) {
         Serial.print(powerL);
         Serial.print(" pwmR:");
         Serial.println(powerR);
+        printOdometry();
       }
 
       // Check if settled (close to target)
@@ -400,16 +414,16 @@ bool turn(float degrees) {
       while (headingError > PI) headingError -= 2 * PI;
       while (headingError < -PI) headingError += 2 * PI;
 
-      // Compute PID output
-      float turnSpeed = computePID(headingError, heading, Kp_heading, Ki_heading, Kd_heading,
+      // Compute PID output (use 0 for measurement to avoid wrap-around issues)
+      float turnSpeed = computePID(headingError, 0, Kp_heading, Ki_heading, Kd_heading,
                                    pidHeading, dt, MAX_PWM);
 
       // Limit turn speed
       turnSpeed = constrain(turnSpeed, -MAX_PWM, MAX_PWM);
 
       // Tank turn: opposite motor directions
-      int powerL = (int)(turnSpeed);
-      int powerR = (int)(-turnSpeed);
+      int powerL = constrain((int)(turnSpeed), -255, 255);
+      int powerR = constrain((int)(-turnSpeed), -255, 255);
 
       drive(powerL, powerR);
 
@@ -423,6 +437,7 @@ bool turn(float degrees) {
         Serial.print(powerL);
         Serial.print(" pwmR:");
         Serial.println(powerR);
+        printOdometry();
       }
 
       // Check if settled
