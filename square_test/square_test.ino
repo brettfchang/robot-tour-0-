@@ -37,15 +37,16 @@ float Kp_pos = 10.0;
 float Ki_pos = 0.0;
 float Kd_pos = 0.5;
 
-float Kp_heading = 150.0;
+float Kp_heading = 80.0;
 float Ki_heading = 1.0;
-float Kd_heading = 5.0;
+float Kd_heading = 5.0;        // For straights
+float Kd_heading_turn = 20.0;  // For turns
 
 float Kp_heading_straight = 1000.0;
 
 // Motion limits
 const int MAX_PWM = 255;
-const int MIN_PWM = 80;
+const int MIN_PWM = 50;
 const float POS_TOLERANCE = 5.0;
 const float HEADING_TOLERANCE = 0.035;
 const int SETTLE_COUNT = 5;
@@ -456,7 +457,7 @@ bool turn(float degrees) {
       while (headingError > PI) headingError -= 2 * PI;
       while (headingError < -PI) headingError += 2 * PI;
 
-      float turnSpeed = computePID(headingError, 0, Kp_heading, Ki_heading, Kd_heading,
+      float turnSpeed = computePID(headingError, 0, Kp_heading, Ki_heading, Kd_heading_turn,
                                    pidHeading, dt, MAX_PWM);
 
       turnSpeed = constrain(turnSpeed, -MAX_PWM, MAX_PWM);

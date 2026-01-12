@@ -53,10 +53,11 @@ target_x = None
 target_y = None
 
 def parse_odometry(line):
-    """Parse odometry from 'X: 123.45 Y: 67.89 Heading: 45.00 deg' format"""
+    """Parse odometry from 'X: 123.45 Y: 67.89 Heading: 45.00 deg' or 'Hdg(gyro): 45.00' format"""
     global current_x, current_y, current_heading
 
-    match = re.search(r'X:\s*([-\d.]+)\s*Y:\s*([-\d.]+)\s*Heading:\s*([-\d.]+)', line)
+    # Match both "Heading:" and "Hdg(gyro):"
+    match = re.search(r'X:\s*([-\d.]+)\s*Y:\s*([-\d.]+)\s*(?:Heading|Hdg\(gyro\)):\s*([-\d.]+)', line)
     if match:
         current_x = float(match.group(1))
         current_y = float(match.group(2))
