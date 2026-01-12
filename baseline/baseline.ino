@@ -16,8 +16,9 @@ const int STBY_PIN = 9;
 // Left encoder:  A0 (channel A), A1 (channel B)
 // Right encoder: A2 (channel A), A3 (channel B)
 
-// Button pin
-const int BUTTON_PIN = 4;
+// Button pins
+const int BUTTON_FORWARD_PIN = 4;  // 500mm straight
+const int BUTTON_TURN_PIN = 8;     // 90° left turn
 
 // Robot measurements - FILL THESE IN
 const float WHEEL_DIAMETER_MM = 73.025;  // 2 7/8 inches
@@ -67,8 +68,9 @@ float heading = 0;    // radians
 // Timing
 unsigned long lastUpdateUs = 0;
 
-// Button state
-int lastButtonVal = HIGH;
+// Button states
+int lastButtonForward = HIGH;
+int lastButtonTurn = HIGH;
 
 // PID state structure (must be defined before use)
 struct PIDState {
@@ -520,13 +522,15 @@ void setup() {
   // Quadrature encoders on A0-A3
   setupEncoders();
 
-  // Button
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  // Buttons
+  pinMode(BUTTON_FORWARD_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_TURN_PIN, INPUT_PULLUP);
 
   enableMotors(false);
 
   Serial.println("Baseline Robot Control");
-  Serial.println("Press button to run test sequence");
+  Serial.println("Button 4: Drive 500mm forward");
+  Serial.println("Button 8: Turn 90 deg left");
   Serial.println("Commands via Serial:");
   Serial.println("  f<dist>  - drive forward (mm), e.g. f500");
   Serial.println("  b<dist>  - drive backward (mm), e.g. b200");
@@ -537,13 +541,29 @@ void setup() {
 }
 
 void loop() {
-  // Button check
-  int buttonVal = digitalRead(BUTTON_PIN);
-  if (lastButtonVal == HIGH && buttonVal == LOW) {
+  // Button 4: Drive 500mm forward
+  int btnForward = digitalRead(BUTTON_FORWARD_PIN);
+  if (lastButtonForward == HIGH && btnForward == LOW) {
     delay(50);  // Debounce
-    runTestSequence();
+    Serial.println("\n--- Button 4: Forward 500mm ---");
+    enableMotors(true);
+    driveStraight(500);
+    enableMotors(false);
+    printOdometry();
   }
-  lastButtonVal = buttonVal;
+  lastButtonForward = btnForward;
+
+  // Button 8: Turn 90° left
+  int btnTurn = digitalRead(BUTTON_TURN_PIN);
+  if (lastButtonTurn == HIGH && btnTurn == LOW) {
+    delay(50);  // Debounce
+    Serial.println("\n--- Button 8: Turn 90 left ---");
+    enableMotors(true);
+    turn(90);
+    enableMotors(false);
+    printOdometry();
+  }
+  lastButtonTurn = btnTurn;
 
   // Serial command handling
   if (Serial.available()) {
