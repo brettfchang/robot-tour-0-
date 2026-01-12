@@ -33,9 +33,9 @@ const float MM_PER_COUNT = (PI * WHEEL_DIAMETER_MM) / COUNTS_PER_REV;
 const unsigned long LOOP_PERIOD_US = 20000;  // 50Hz
 
 // Velocity PID gains (inner loop - controls PWM to achieve target velocity)
-float Kp_vel = 0.5;
+float Kp_vel = 4.0;
 float Ki_vel = 0.4;
-float Kd_vel = 0.002;
+float Kd_vel = 0.0;
 const float MAX_VELOCITY = 300.0;  // mm/s max speed
 
 // Position PID gains (outer loop - outputs target velocity)
