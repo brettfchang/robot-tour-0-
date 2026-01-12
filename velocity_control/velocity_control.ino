@@ -33,7 +33,7 @@ const float MM_PER_COUNT = (PI * WHEEL_DIAMETER_MM) / COUNTS_PER_REV;
 const unsigned long LOOP_PERIOD_US = 20000;  // 50Hz
 
 // Velocity PID gains (inner loop - controls PWM to achieve target velocity)
-float Kp_vel = 0.08;
+float Kp_vel = 0.8;
 float Ki_vel = 0.0;
 float Kd_vel = 0.0;
 const float MAX_VELOCITY = 300.0;  // mm/s max speed
@@ -288,7 +288,8 @@ void driveRaw(int pwmL, int pwmR) {
   pwmL = constrain(pwmL, -255, 255);
   pwmR = constrain(pwmR, -255, 255);
 
-  // Flip right motor direction
+  // Flip motor directions
+  pwmL = -pwmL;
   pwmR = -pwmR;
 
   if (pwmL < 0) {
@@ -332,14 +333,6 @@ void driveVelocity(float targetVelL, float targetVelR, float dt, int &pwmLOut, i
                           pidVelLeft, dt, MAX_PWM);
   float pwmR = computePID(velErrorR, velRight, Kp_vel, Ki_vel, Kd_vel,
                           pidVelRight, dt, MAX_PWM);
-
-  // Add feedforward based on target velocity (rough estimate)
-  // This helps the PID not have to do all the work
-  float ffL = targetVelL * 0.5;  // Feedforward gain
-  float ffR = targetVelR * 0.5;
-
-  pwmL += ffL;
-  pwmR += ffR;
 
   // Apply deadband compensation
   if (pwmL > 0) pwmL = max(pwmL, (float)MIN_PWM);
