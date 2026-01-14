@@ -2,6 +2,23 @@
 // Button 4 runs a 500mm square (right turns)
 // Uses MPU6050 gyro for heading
 
+// ============== HARDWARE MAPPING ==============
+// Tested with motor_encoder_test on 2026-01-13
+//
+// MOTORS:
+//   LEFT wheel  = Motor A (PWMA, AIN1, AIN2)
+//   RIGHT wheel = Motor B (PWMB, BIN1, BIN2)
+//   +PWM = forward for both (robot drives forward)
+//
+// ENCODERS:
+//   LEFT wheel  = Enc1 (A2, A3) - goes NEGATIVE when forward
+//   RIGHT wheel = Enc0 (A0, A1) - goes POSITIVE when forward
+//
+// Note: Encoder pins are SWAPPED from motor pins!
+//   Motor A (left)  uses Enc1 (A2,A3)
+//   Motor B (right) uses Enc0 (A0,A1)
+// ================================================
+
 #include <Wire.h>
 
 // ============== CONFIGURATION ==============
@@ -9,13 +26,13 @@
 // MPU6050 I2C address
 const int MPU6050_ADDR = 0x68;
 
-// Motor pins
-const int PWMA_PIN = 11;
-const int AIN1_PIN = 10;
-const int AIN2_PIN = 12;
-const int PWMB_PIN = 5;
-const int BIN1_PIN = 7;
-const int BIN2_PIN = 6;
+// Motor pins (Motor A = LEFT, Motor B = RIGHT)
+const int PWMA_PIN = 11;   // Left motor PWM
+const int AIN1_PIN = 10;   // Left motor dir
+const int AIN2_PIN = 12;   // Left motor dir
+const int PWMB_PIN = 5;    // Right motor PWM
+const int BIN1_PIN = 7;    // Right motor dir
+const int BIN2_PIN = 6;    // Right motor dir
 const int STBY_PIN = 9;
 
 // Button pin
@@ -33,7 +50,7 @@ const float MM_PER_COUNT = (PI * WHEEL_DIAMETER_MM) / COUNTS_PER_REV;
 const unsigned long LOOP_PERIOD_US = 20000;  // 50Hz
 
 // Velocity PID gains (inner loop - controls PWM to achieve target velocity)
-float Kp_vel = 0.8;
+float Kp_vel = 0.0;
 float Ki_vel = 0.0;
 float Kd_vel = 0.0;
 const float MAX_VELOCITY = 300.0;  // mm/s max speed
@@ -100,6 +117,9 @@ PIDState pidVelLeft = {0, 0, 0, 0};
 PIDState pidVelRight = {0, 0, 0, 0};
 
 // ============== QUADRATURE ENCODER ==============
+// Encoder mapping (see HARDWARE MAPPING at top):
+//   Enc0 (A0,A1) = RIGHT wheel, +ve when forward
+//   Enc1 (A2,A3) = LEFT wheel, -ve when forward (so we negate it)
 
 volatile uint8_t lastPinState = 0;
 
@@ -113,19 +133,21 @@ const int8_t QUAD_TABLE[16] = {
 ISR(PCINT1_vect) {
   uint8_t currentState = PINC;
 
-  uint8_t leftOldA = (lastPinState >> 0) & 1;
-  uint8_t leftOldB = (lastPinState >> 1) & 1;
-  uint8_t leftNewA = (currentState >> 0) & 1;
-  uint8_t leftNewB = (currentState >> 1) & 1;
-  uint8_t leftIdx = (leftOldA << 3) | (leftOldB << 2) | (leftNewA << 1) | leftNewB;
-  encLeft += QUAD_TABLE[leftIdx];
+  // Enc0 (A0,A1) = RIGHT wheel encoder, positive when forward
+  uint8_t enc0OldA = (lastPinState >> 0) & 1;
+  uint8_t enc0OldB = (lastPinState >> 1) & 1;
+  uint8_t enc0NewA = (currentState >> 0) & 1;
+  uint8_t enc0NewB = (currentState >> 1) & 1;
+  uint8_t enc0Idx = (enc0OldA << 3) | (enc0OldB << 2) | (enc0NewA << 1) | enc0NewB;
+  encRight += QUAD_TABLE[enc0Idx];  // Enc0 = Right
 
-  uint8_t rightOldA = (lastPinState >> 2) & 1;
-  uint8_t rightOldB = (lastPinState >> 3) & 1;
-  uint8_t rightNewA = (currentState >> 2) & 1;
-  uint8_t rightNewB = (currentState >> 3) & 1;
-  uint8_t rightIdx = (rightOldA << 3) | (rightOldB << 2) | (rightNewA << 1) | rightNewB;
-  encRight -= QUAD_TABLE[rightIdx];  // Inverted
+  // Enc1 (A2,A3) = LEFT wheel encoder, negative when forward (so negate)
+  uint8_t enc1OldA = (lastPinState >> 2) & 1;
+  uint8_t enc1OldB = (lastPinState >> 3) & 1;
+  uint8_t enc1NewA = (currentState >> 2) & 1;
+  uint8_t enc1NewB = (currentState >> 3) & 1;
+  uint8_t enc1Idx = (enc1OldA << 3) | (enc1OldB << 2) | (enc1NewA << 1) | enc1NewB;
+  encLeft -= QUAD_TABLE[enc1Idx];  // Enc1 = Left, negated so forward = +ve
 
   lastPinState = currentState;
 }
@@ -210,9 +232,9 @@ void updateOdometry(float dt) {
   float distRight = deltaRight * MM_PER_COUNT;
 
   // Calculate wheel velocities (mm/s)
-  // Note: distRight sign is inverted from encoder, flip it back for velocity feedback
+  // Encoder mapping is handled in ISR - both go positive when forward
   velLeft = distLeft / dt;
-  velRight = -distRight / dt;
+  velRight = distRight / dt;
 
   float distCenter = (distLeft + distRight) / 2.0;
 
@@ -288,9 +310,8 @@ void driveRaw(int pwmL, int pwmR) {
   pwmL = constrain(pwmL, -255, 255);
   pwmR = constrain(pwmR, -255, 255);
 
-  // Flip motor directions
-  pwmL = -pwmL;
-  pwmR = -pwmR;
+  // Motor A = Left, Motor B = Right
+  // +PWM = forward for both (no flip needed)
 
   if (pwmL < 0) {
     digitalWrite(AIN1_PIN, LOW);
@@ -321,18 +342,36 @@ void brake() {
   analogWrite(PWMB_PIN, 0);
 }
 
+// Feedforward gain (0 = disabled)
+float Kff_vel = 0.4;
+
+// PWM slew rate limit (PWM units per second, 0 = disabled)
+float pwmSlewRate = 0.0;  // Disabled for bang-bang test
+
+// Previous PWM values for slew rate limiting
+float prevPwmL = 0;
+float prevPwmR = 0;
+
+// Simple velocity control: feedforward + error correction
+// No PID, just FF + (error / errorDivisor)
+float errorDivisor = 4.0;
+
 // Closed-loop velocity control - takes target velocities (mm/s), outputs PWM
-// Returns the PWM values applied
-void driveVelocity(float targetVelL, float targetVelR, float dt, int &pwmLOut, int &pwmROut) {
+// Returns the PWM values applied and feedforward values
+void driveVelocity(float targetVelL, float targetVelR, float dt, int &pwmLOut, int &pwmROut, float &ffLOut, float &ffROut) {
   // Velocity errors
   float velErrorL = targetVelL - velLeft;
   float velErrorR = targetVelR - velRight;
 
-  // Velocity PIDs output PWM adjustments
-  float pwmL = computePID(velErrorL, velLeft, Kp_vel, Ki_vel, Kd_vel,
-                          pidVelLeft, dt, MAX_PWM);
-  float pwmR = computePID(velErrorR, velRight, Kp_vel, Ki_vel, Kd_vel,
-                          pidVelRight, dt, MAX_PWM);
+  // Feedforward based on target velocity
+  float ffL = targetVelL * Kff_vel;
+  float ffR = targetVelR * Kff_vel;
+  ffLOut = ffL;
+  ffROut = ffR;
+
+  // Simple control: FF + error/4
+  float pwmL = ffL + (velErrorL / errorDivisor);
+  float pwmR = ffR + (velErrorR / errorDivisor);
 
   // Apply deadband compensation
   if (pwmL > 0) pwmL = max(pwmL, (float)MIN_PWM);
@@ -342,6 +381,16 @@ void driveVelocity(float targetVelL, float targetVelR, float dt, int &pwmLOut, i
   if (pwmR > 0) pwmR = max(pwmR, (float)MIN_PWM);
   else if (pwmR < 0) pwmR = min(pwmR, (float)-MIN_PWM);
   else if (abs(targetVelR) < 1.0) pwmR = 0;
+
+  // Apply slew rate limiting
+  if (pwmSlewRate > 0) {
+    float maxChange = pwmSlewRate * dt;
+    pwmL = constrain(pwmL, prevPwmL - maxChange, prevPwmL + maxChange);
+    pwmR = constrain(pwmR, prevPwmR - maxChange, prevPwmR + maxChange);
+  }
+
+  prevPwmL = pwmL;
+  prevPwmR = pwmR;
 
   pwmLOut = constrain((int)pwmL, -255, 255);
   pwmROut = constrain((int)pwmR, -255, 255);
@@ -424,15 +473,18 @@ bool driveStraight(float distanceMm) {
 
       // Inner loop: velocity control
       int pwmL, pwmR;
-      driveVelocity(targetVelL, targetVelR, dt, pwmL, pwmR);
+      float ffL, ffR;
+      driveVelocity(targetVelL, targetVelR, dt, pwmL, pwmR, ffL, ffR);
 
       unsigned long nowMs = millis();
       if (nowMs - lastLog >= 100) {
         lastLog = nowMs;
         Serial.print("dist:");
         Serial.print(distError);
-        Serial.print(" tgtVel:");
-        Serial.print(targetVel);
+        Serial.print(" tgtVelL:");
+        Serial.print(targetVelL);
+        Serial.print(" tgtVelR:");
+        Serial.print(targetVelR);
         Serial.print(" velL:");
         Serial.print(velLeft);
         Serial.print(" velR:");
@@ -440,7 +492,11 @@ bool driveStraight(float distanceMm) {
         Serial.print(" pwmL:");
         Serial.print(pwmL);
         Serial.print(" pwmR:");
-        Serial.println(pwmR);
+        Serial.print(pwmR);
+        Serial.print(" ffL:");
+        Serial.print(ffL);
+        Serial.print(" ffR:");
+        Serial.println(ffR);
         printOdometry();
       }
 
@@ -523,7 +579,8 @@ bool turn(float degrees) {
 
       // Inner loop: velocity control
       int pwmL, pwmR;
-      driveVelocity(targetVelL, targetVelR, dt, pwmL, pwmR);
+      float ffL, ffR;
+      driveVelocity(targetVelL, targetVelR, dt, pwmL, pwmR, ffL, ffR);
 
       unsigned long nowMs = millis();
       if (nowMs - lastLog >= 100) {
@@ -539,7 +596,11 @@ bool turn(float degrees) {
         Serial.print(" pwmL:");
         Serial.print(pwmL);
         Serial.print(" pwmR:");
-        Serial.println(pwmR);
+        Serial.print(pwmR);
+        Serial.print(" ffL:");
+        Serial.print(ffL);
+        Serial.print(" ffR:");
+        Serial.println(ffR);
         printOdometry();
       }
 

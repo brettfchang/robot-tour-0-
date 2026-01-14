@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
 """
-Robot Odometry + Velocity Visualizer
-Reads serial data from Arduino and plots robot position and wheel velocities in real-time
+Sequence Move Visualizer
+Shows per-move progress (distance/heading) plus velocity and PWM graphs
 """
 
 import serial
 import serial.tools.list_ports
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 from matplotlib.animation import FuncAnimation
 from collections import deque
 import re
 import sys
-import math
 
 BAUD_RATE = 115200
-HISTORY_LENGTH = 200  # Number of velocity samples to keep
+HISTORY_LENGTH = 200
 
 def find_arduino_port():
     """Auto-detect Arduino serial port"""
     ports = serial.tools.list_ports.comports()
-
     arduino_keywords = ['arduino', 'usbmodem', 'usbserial', 'ch340', 'cp210', 'ftdi', 'acm']
 
     for port in ports:
@@ -37,22 +34,14 @@ def find_arduino_port():
 
     return None
 
-# Robot dimensions for visualization (mm)
-ROBOT_LENGTH = 150
-ROBOT_WIDTH = 120
-
-# Track history
-history_x = [0]
-history_y = [0]
-current_x = 0
-current_y = 0
+# Current move state
+current_move = "Idle"
+move_target = 0
+move_progress = 0
 current_heading = 0
+target_heading = 0
 
-# Target point (if any)
-target_x = None
-target_y = None
-
-# Velocity history
+# Velocity/PWM history
 time_history = deque(maxlen=HISTORY_LENGTH)
 vel_left_history = deque(maxlen=HISTORY_LENGTH)
 vel_right_history = deque(maxlen=HISTORY_LENGTH)
@@ -64,7 +53,11 @@ ff_left_history = deque(maxlen=HISTORY_LENGTH)
 ff_right_history = deque(maxlen=HISTORY_LENGTH)
 time_counter = 0
 
-# Current velocities
+# Move history for the sequence view
+move_history = []  # List of (move_type, target, achieved)
+current_move_start_time = 0
+
+# Current values
 current_vel_left = 0
 current_vel_right = 0
 current_target_vel_left = 0
@@ -74,37 +67,51 @@ current_pwm_right = 0
 current_ff_left = 0
 current_ff_right = 0
 
-def parse_odometry(line):
-    """Parse odometry from 'X: 123.45 Y: 67.89 Heading: 45.00 deg' format"""
-    global current_x, current_y, current_heading
+def parse_move_start(line):
+    """Parse move start messages"""
+    global current_move, move_target, move_progress, current_move_start_time, time_counter
+    global target_heading
 
-    match = re.search(r'X:\s*([-\d.]+)\s*Y:\s*([-\d.]+)\s*(?:Heading|Hdg\(gyro\)):\s*([-\d.]+)', line)
+    # Forward/Backward
+    match = re.search(r'(Forward|Backward)\s+([\d.]+)\s*mm', line)
     if match:
-        current_x = float(match.group(1))
-        current_y = float(match.group(2))
-        current_heading = float(match.group(3)) * math.pi / 180
-        history_x.append(current_x)
-        history_y.append(current_y)
+        current_move = match.group(1)
+        move_target = float(match.group(2))
+        move_progress = 0
+        current_move_start_time = time_counter
         return True
+
+    # Turn
+    match = re.search(r'Turn (left|right) 90', line)
+    if match:
+        current_move = f"Turn {match.group(1)}"
+        move_target = 90
+        move_progress = 0
+        current_move_start_time = time_counter
+        return True
+
     return False
 
-def parse_target(line):
-    """Parse target from 'Driving to: 123.45, 67.89' format"""
-    global target_x, target_y
+def parse_move_done(line):
+    """Parse move completion"""
+    global current_move, move_history
 
-    match = re.search(r'Driving to:\s*([-\d.]+),\s*([-\d.]+)', line)
-    if match:
-        target_x = float(match.group(1))
-        target_y = float(match.group(2))
+    if line.strip() == "Done" or "Done." in line:
+        if current_move != "Idle":
+            move_history.append((current_move, move_target, move_progress))
+            if len(move_history) > 10:
+                move_history.pop(0)
+        current_move = "Idle"
         return True
     return False
 
 def parse_velocity(line):
-    """Parse velocity data with per-wheel targets"""
-    global current_vel_left, current_vel_right, current_target_vel_left, current_target_vel_right, time_counter
-    global current_pwm_left, current_pwm_right, current_ff_left, current_ff_right
+    """Parse velocity data"""
+    global current_vel_left, current_vel_right, current_target_vel_left, current_target_vel_right
+    global current_pwm_left, current_pwm_right, current_ff_left, current_ff_right, time_counter
+    global move_progress
 
-    # Match straight line format: tgtVelL:X tgtVelR:Y velL:Z velR:W pwmL:A pwmR:B ffL:C ffR:D
+    # Match: tgtVelL:X tgtVelR:Y velL:Z velR:W pwmL:A pwmR:B ffL:C ffR:D
     match = re.search(r'tgtVelL:\s*([-\d.]+)\s*tgtVelR:\s*([-\d.]+)\s*velL:\s*([-\d.]+)\s*velR:\s*([-\d.]+)\s*pwmL:\s*([-\d.]+)\s*pwmR:\s*([-\d.]+)\s*ffL:\s*([-\d.]+)\s*ffR:\s*([-\d.]+)', line)
     if match:
         current_target_vel_left = float(match.group(1))
@@ -125,6 +132,11 @@ def parse_velocity(line):
         pwm_right_history.append(current_pwm_right)
         ff_left_history.append(current_ff_left)
         ff_right_history.append(current_ff_right)
+
+        # Estimate progress from velocity (rough integration)
+        avg_vel = (current_vel_left + current_vel_right) / 2
+        move_progress += abs(avg_vel) * 0.01  # 10ms sample
+
         time_counter += 1
         return True
 
@@ -138,7 +150,6 @@ def parse_velocity(line):
         current_pwm_right = float(match.group(5))
         current_ff_left = float(match.group(6))
         current_ff_right = float(match.group(7))
-        # For turns: left = +turnVel, right = -turnVel
         current_target_vel_left = turn_vel
         current_target_vel_right = -turn_vel
 
@@ -156,16 +167,27 @@ def parse_velocity(line):
 
     return False
 
-# Set up the plot with subplots (2 rows x 3 cols)
+def parse_kff(line):
+    """Parse adaptive coefficient updates"""
+    match = re.search(r'kffL=([\d.]+)\s*kffR=([\d.]+)', line)
+    if match:
+        return float(match.group(1)), float(match.group(2))
+    return None
+
+# Set up the plot (2 rows x 3 cols)
 fig = plt.figure(figsize=(16, 8))
 
-# Position plot (left side, spans both rows)
-ax_pos = fig.add_subplot(1, 3, 1)
-ax_pos.set_aspect('equal')
-ax_pos.grid(True, alpha=0.3)
-ax_pos.set_xlabel('X (mm)')
-ax_pos.set_ylabel('Y (mm)')
-ax_pos.set_title('Robot Position')
+# Move status (top left)
+ax_move = fig.add_subplot(2, 3, 1)
+ax_move.set_xlim(0, 1)
+ax_move.set_ylim(0, 1)
+ax_move.axis('off')
+ax_move.set_title('Current Move')
+
+# Move history (bottom left)
+ax_history = fig.add_subplot(2, 3, 4)
+ax_history.axis('off')
+ax_history.set_title('Move History')
 
 # Velocity plots (middle column)
 ax_vel_left = fig.add_subplot(2, 3, 2)
@@ -191,22 +213,6 @@ ax_pwm_right.set_xlabel('Sample')
 ax_pwm_right.set_ylabel('PWM')
 ax_pwm_right.set_title('Right Wheel PWM')
 
-# Position plot elements
-path_line, = ax_pos.plot([], [], 'b-', linewidth=1, alpha=0.5, label='Path')
-robot_body = patches.Rectangle((0, 0), ROBOT_LENGTH, ROBOT_WIDTH,
-                                 fill=True, color='blue', alpha=0.5)
-robot_direction = ax_pos.arrow(0, 0, 0, 0, head_width=20, head_length=15, fc='red', ec='red')
-target_marker, = ax_pos.plot([], [], 'gx', markersize=15, markeredgewidth=3, label='Target')
-start_marker, = ax_pos.plot([0], [0], 'ko', markersize=8, label='Start')
-
-ax_pos.add_patch(robot_body)
-ax_pos.legend(loc='upper left')
-
-# Status text
-status_text = ax_pos.text(0.02, 0.98, '', transform=ax_pos.transAxes,
-                          verticalalignment='top', fontfamily='monospace',
-                          fontsize=9, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
 # Velocity plot elements
 vel_left_line, = ax_vel_left.plot([], [], 'b-', linewidth=1, label='Actual')
 target_left_line, = ax_vel_left.plot([], [], 'r--', linewidth=1, label='Target')
@@ -225,12 +231,18 @@ pwm_right_line, = ax_pwm_right.plot([], [], 'g-', linewidth=1, label='PWM')
 ff_right_line, = ax_pwm_right.plot([], [], 'm-', linewidth=1, alpha=0.7, label='Feedforward')
 ax_pwm_right.legend(loc='upper right')
 
+# Text elements for move display
+move_text = None
+progress_bar = None
+history_text = None
+kff_left = 0.8
+kff_right = 0.8
+
 # Serial connection
 ser = None
-serial_port = None
 
 def init_serial(port=None):
-    global ser, serial_port
+    global ser
 
     if port is None:
         port = find_arduino_port()
@@ -239,20 +251,18 @@ def init_serial(port=None):
         print("No serial ports found!")
         return False
 
-    serial_port = port
-
     try:
-        ser = serial.Serial(serial_port, BAUD_RATE, timeout=0.1)
-        print(f"Connected to {serial_port}")
+        ser = serial.Serial(port, BAUD_RATE, timeout=0.1)
+        print(f"Connected to {port}")
         return True
     except serial.SerialException as e:
-        print(f"Error opening serial port {serial_port}: {e}")
+        print(f"Error opening serial port: {e}")
         return False
 
 def update(frame):
-    global robot_direction
+    global move_text, progress_bar, history_text, kff_left, kff_right
 
-    # Read all available serial data
+    # Read serial data
     if ser and ser.in_waiting:
         try:
             lines = ser.read(ser.in_waiting).decode('utf-8', errors='ignore').split('\n')
@@ -260,73 +270,86 @@ def update(frame):
                 line = line.strip()
                 if line:
                     print(line)  # Echo to console
-                    parse_odometry(line)
-                    parse_target(line)
+                    parse_move_start(line)
+                    parse_move_done(line)
                     parse_velocity(line)
+                    kff_result = parse_kff(line)
+                    if kff_result:
+                        kff_left, kff_right = kff_result
         except Exception as e:
             print(f"Serial error: {e}")
 
-    # Update path
-    path_line.set_data(history_x, history_y)
+    # Clear and redraw move status
+    ax_move.clear()
+    ax_move.set_xlim(0, 1)
+    ax_move.set_ylim(0, 1)
+    ax_move.axis('off')
+    ax_move.set_title('Current Move')
 
-    # Update robot position and orientation
-    cos_h = math.cos(current_heading)
-    sin_h = math.sin(current_heading)
+    # Move type and progress
+    if current_move == "Idle":
+        status = "Idle - Waiting for button press"
+        progress_pct = 0
+        color = 'gray'
+    elif "Forward" in current_move or "Backward" in current_move:
+        progress_pct = min(100, (move_progress / move_target) * 100) if move_target > 0 else 0
+        status = f"{current_move}\n{move_progress:.0f} / {move_target:.0f} mm ({progress_pct:.0f}%)"
+        color = 'blue' if "Forward" in current_move else 'orange'
+    else:  # Turn
+        progress_pct = min(100, (move_progress / move_target) * 100) if move_target > 0 else 0
+        status = f"{current_move}\nProgress: {progress_pct:.0f}%"
+        color = 'green' if "left" in current_move else 'red'
 
-    cx, cy = current_x, current_y
-    hw, hl = ROBOT_WIDTH / 2, ROBOT_LENGTH / 2
+    ax_move.text(0.5, 0.7, status, ha='center', va='center', fontsize=14,
+                 fontweight='bold', transform=ax_move.transAxes)
 
-    robot_body.set_xy((cx - hl * cos_h + hw * sin_h,
-                       cy - hl * sin_h - hw * cos_h))
-    robot_body.set_angle(math.degrees(current_heading))
+    # Progress bar
+    ax_move.add_patch(plt.Rectangle((0.1, 0.35), 0.8, 0.15, fill=False, edgecolor='black', linewidth=2))
+    ax_move.add_patch(plt.Rectangle((0.1, 0.35), 0.8 * (progress_pct / 100), 0.15,
+                                     fill=True, facecolor=color, alpha=0.7))
 
-    # Update direction arrow
-    robot_direction.remove()
-    arrow_len = ROBOT_LENGTH * 0.8
-    robot_direction = ax_pos.arrow(cx, cy,
-                               arrow_len * cos_h, arrow_len * sin_h,
-                               head_width=20, head_length=15, fc='red', ec='red')
+    # Adaptive coefficient display
+    ax_move.text(0.5, 0.15, f"kffL: {kff_left:.3f}  |  kffR: {kff_right:.3f}",
+                 ha='center', va='center', fontsize=10, fontfamily='monospace',
+                 transform=ax_move.transAxes)
 
-    # Update target marker
-    if target_x is not None:
-        target_marker.set_data([target_x], [target_y])
+    # Move history
+    ax_history.clear()
+    ax_history.set_xlim(0, 1)
+    ax_history.set_ylim(0, 1)
+    ax_history.axis('off')
+    ax_history.set_title('Move History')
 
-    # Update status text
-    status = f'Position: ({current_x:.1f}, {current_y:.1f}) mm\n'
-    status += f'Heading: {math.degrees(current_heading):.1f}\u00b0\n'
-    status += f'Vel L: {current_vel_left:.1f} mm/s\n'
-    status += f'Vel R: {current_vel_right:.1f} mm/s'
-    if target_x is not None:
-        dist = math.sqrt((target_x - current_x)**2 + (target_y - current_y)**2)
-        status += f'\nTarget: ({target_x:.1f}, {target_y:.1f})\nDist: {dist:.1f} mm'
-    status_text.set_text(status)
+    if move_history:
+        history_str = ""
+        for i, (move_type, target, achieved) in enumerate(reversed(move_history[-5:])):
+            if "Forward" in move_type or "Backward" in move_type:
+                history_str += f"{move_type}: {achieved:.0f}/{target:.0f} mm\n"
+            else:
+                history_str += f"{move_type}: done\n"
+        ax_history.text(0.1, 0.9, history_str, ha='left', va='top', fontsize=10,
+                       fontfamily='monospace', transform=ax_history.transAxes)
+    else:
+        ax_history.text(0.5, 0.5, "No moves yet", ha='center', va='center',
+                       fontsize=10, color='gray', transform=ax_history.transAxes)
 
-    # Auto-scale position plot
-    if len(history_x) > 1:
-        all_x = history_x + ([target_x] if target_x else [])
-        all_y = history_y + ([target_y] if target_y else [])
-        margin = 200
-        ax_pos.set_xlim(min(all_x) - margin, max(all_x) + margin)
-        ax_pos.set_ylim(min(all_y) - margin, max(all_y) + margin)
-
-    # Update velocity and PWM plots
+    # Update velocity plots
     if len(time_history) > 0:
         times = list(time_history)
 
-        # Velocity plots
         vel_left_line.set_data(times, list(vel_left_history))
         target_left_line.set_data(times, list(target_vel_left_history))
         vel_right_line.set_data(times, list(vel_right_history))
         target_right_line.set_data(times, list(target_vel_right_history))
 
-        # PWM plots
         pwm_left_line.set_data(times, list(pwm_left_history))
         ff_left_line.set_data(times, list(ff_left_history))
         pwm_right_line.set_data(times, list(pwm_right_history))
         ff_right_line.set_data(times, list(ff_right_history))
 
-        # Auto-scale velocity plots
-        vel_vals = list(vel_left_history) + list(vel_right_history) + list(target_vel_left_history) + list(target_vel_right_history)
+        # Auto-scale velocity
+        vel_vals = list(vel_left_history) + list(vel_right_history) + \
+                   list(target_vel_left_history) + list(target_vel_right_history)
         if vel_vals:
             min_vel = min(vel_vals) - 20
             max_vel = max(vel_vals) + 20
@@ -335,8 +358,9 @@ def update(frame):
             ax_vel_right.set_xlim(times[0], times[-1] + 1)
             ax_vel_right.set_ylim(min_vel, max_vel)
 
-        # Auto-scale PWM plots
-        pwm_vals = list(pwm_left_history) + list(pwm_right_history) + list(ff_left_history) + list(ff_right_history)
+        # Auto-scale PWM
+        pwm_vals = list(pwm_left_history) + list(pwm_right_history) + \
+                   list(ff_left_history) + list(ff_right_history)
         if pwm_vals:
             min_pwm = min(pwm_vals) - 20
             max_pwm = max(pwm_vals) + 20
@@ -345,13 +369,14 @@ def update(frame):
             ax_pwm_right.set_xlim(times[0], times[-1] + 1)
             ax_pwm_right.set_ylim(min_pwm, max_pwm)
 
-    return path_line, robot_body, target_marker, status_text, vel_left_line, vel_right_line, target_left_line, target_right_line, pwm_left_line, pwm_right_line, ff_left_line, ff_right_line
+    return (vel_left_line, vel_right_line, target_left_line, target_right_line,
+            pwm_left_line, pwm_right_line, ff_left_line, ff_right_line)
 
 def main():
     port = sys.argv[1] if len(sys.argv) > 1 else None
 
-    print("Robot Odometry + Velocity Visualizer")
-    print("Usage: python visualizer_velocity.py [serial_port]")
+    print("Sequence Move Visualizer")
+    print("Usage: python visualizer_sequence.py [serial_port]")
     print()
 
     if port:
@@ -361,7 +386,6 @@ def main():
 
     if not init_serial(port):
         print("\nRunning in demo mode (no serial connection)")
-        print("Press 'q' to quit")
 
     plt.tight_layout()
     ani = FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
