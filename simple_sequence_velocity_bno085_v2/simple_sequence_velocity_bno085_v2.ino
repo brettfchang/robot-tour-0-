@@ -406,7 +406,7 @@ void driveForward(float distanceMm) {
 
   // Position PID state
   float posIntegral = 0;
-  float posLastError = 0;
+  float posLastError = distanceMm;  // Initialize to starting error to avoid derivative spike
 
   unsigned long lastTime = millis();
 
@@ -533,7 +533,7 @@ void driveBackward(float distanceMm) {
 
   // Position PID state
   float posIntegral = 0;
-  float posLastError = 0;
+  float posLastError = distanceMm;  // Initialize to starting error to avoid derivative spike
 
   unsigned long lastTime = millis();
 
