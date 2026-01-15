@@ -50,21 +50,26 @@ const float WHEEL_DIAMETER_MM = 73.025;
 const int COUNTS_PER_REV = 900;
 const float MM_PER_COUNT = (PI * WHEEL_DIAMETER_MM) / COUNTS_PER_REV;
 
-// Velocity control
-const float TARGET_VELOCITY = 200.0;   // mm/s for straights
-const float TURN_VELOCITY = 100.0;     // mm/s for turns
-const float VELOCITY_RAMP = 150.0;     // mm/s^2 acceleration limit
+// Cascaded control: Position PID → Adaptive Feedforward Velocity
 
-// Adaptive feedforward
+// Outer loop: Position PID (outputs target velocity)
+const float POS_Kp = 3.0;              // mm/s per mm error
+const float POS_Ki = 0.1;              // Integral gain
+const float POS_Kd = 0.5;              // Derivative gain
+const float POS_INTEGRAL_MAX = 1000.0; // Integral windup limit
+const float MAX_VELOCITY = 300.0;      // Max velocity output from position PID
+
+// Inner loop: Adaptive feedforward velocity control
 const float INITIAL_KFF = 0.8;         // Initial PWM per mm/s
-const float ADAPT_RATE = 0.02;         // How fast coefficient adapts (per sample)
-const int ADAPT_WINDOW_MS = 1000;      // Window for smoothing (1 second)
+const float ADAPT_RATE = 0.02;         // How fast coefficient adapts
+const float VEL_Kp = 0.25;             // Small P correction on velocity error
+
 const int SAMPLE_INTERVAL_MS = 10;     // Control loop interval
-const int SAMPLES_IN_WINDOW = ADAPT_WINDOW_MS / SAMPLE_INTERVAL_MS;  // 100 samples
 
 // Heading control
 const float HEADING_Kp = 3.0;          // Heading correction during straights
 const float TURN_Kp = 2.0;             // Turn speed control
+const float TURN_VELOCITY = 100.0;     // Max turn velocity (mm/s)
 
 // Tolerances
 const float HEADING_TOLERANCE = 2.0;   // degrees
@@ -85,14 +90,8 @@ int targetHeading = 0;      // Target heading (0, 90, 180, 270)
 float headingOffset = 0;    // For zeroing heading
 
 // Adaptive feedforward state
-float kffLeft = INITIAL_KFF;   // Learned coefficient for left wheel
-float kffRight = INITIAL_KFF;  // Learned coefficient for right wheel
-
-// Circular buffers for smoothing (stores PWM/velocity ratios)
-float ratioHistoryLeft[100];
-float ratioHistoryRight[100];
-int historyIndex = 0;
-int historyCount = 0;
+float kffLeft = INITIAL_KFF;
+float kffRight = INITIAL_KFF;
 
 // ============== MINIMAL BNO085 DRIVER ==============
 
@@ -383,56 +382,6 @@ void stop() {
   analogWrite(PWMB_PIN, 0);
 }
 
-// ============== ADAPTIVE FEEDFORWARD ==============
-
-void resetAdaptive() {
-  kffLeft = INITIAL_KFF;
-  kffRight = INITIAL_KFF;
-  historyIndex = 0;
-  historyCount = 0;
-}
-
-void updateAdaptive(float velLeft, float velRight, float pwmLeft, float pwmRight) {
-  // Only update when moving at reasonable speed (avoid division issues)
-  const float MIN_VEL = 20.0;  // mm/s
-
-  if (abs(velLeft) > MIN_VEL && abs(pwmLeft) > MIN_PWM) {
-    float ratioL = abs(pwmLeft) / abs(velLeft);
-    ratioHistoryLeft[historyIndex] = ratioL;
-  } else {
-    ratioHistoryLeft[historyIndex] = kffLeft;  // Keep current estimate
-  }
-
-  if (abs(velRight) > MIN_VEL && abs(pwmRight) > MIN_PWM) {
-    float ratioR = abs(pwmRight) / abs(velRight);
-    ratioHistoryRight[historyIndex] = ratioR;
-  } else {
-    ratioHistoryRight[historyIndex] = kffRight;
-  }
-
-  historyIndex = (historyIndex + 1) % SAMPLES_IN_WINDOW;
-  if (historyCount < SAMPLES_IN_WINDOW) historyCount++;
-
-  // Compute smoothed average
-  if (historyCount > 10) {  // Wait for some samples
-    float sumL = 0, sumR = 0;
-    for (int i = 0; i < historyCount; i++) {
-      sumL += ratioHistoryLeft[i];
-      sumR += ratioHistoryRight[i];
-    }
-    float avgL = sumL / historyCount;
-    float avgR = sumR / historyCount;
-
-    // Gradually adapt toward the smoothed average
-    kffLeft += ADAPT_RATE * (avgL - kffLeft);
-    kffRight += ADAPT_RATE * (avgR - kffRight);
-
-    // Clamp to reasonable range
-    kffLeft = constrain(kffLeft, 0.3, 2.0);
-    kffRight = constrain(kffRight, 0.3, 2.0);
-  }
-}
-
 // ============== MOVEMENT ==============
 
 float getHeadingError() {
@@ -455,15 +404,18 @@ void driveForward(float distanceMm) {
   long lastRight = startRight;
   interrupts();
 
+  // Position PID state
+  float posIntegral = 0;
+  float posLastError = 0;
+
   unsigned long lastTime = millis();
-  float currentTargetVel = 0;  // For ramping
-  int settleCount = 0;
 
   while (true) {
     updateIMU();
 
     unsigned long now = millis();
     float dt = (now - lastTime) / 1000.0;
+    if (dt < 0.001) dt = 0.001;
     lastTime = now;
 
     noInterrupts();
@@ -475,7 +427,6 @@ void driveForward(float distanceMm) {
     float distLeft = (left - startLeft) * MM_PER_COUNT;
     float distRight = (right - startRight) * MM_PER_COUNT;
     float distTraveled = (distLeft + distRight) / 2.0;
-    float distRemaining = distanceMm - distTraveled;
 
     // Calculate actual velocities
     float velLeft = (left - lastLeft) * MM_PER_COUNT / dt;
@@ -483,8 +434,11 @@ void driveForward(float distanceMm) {
     lastLeft = left;
     lastRight = right;
 
+    // Position error
+    float posError = distanceMm - distTraveled;
+
     // Check if done
-    if (distRemaining <= 0) {
+    if (posError < DISTANCE_TOLERANCE) {
       stop();
       Serial.print("Done. kffL=");
       Serial.print(kffLeft, 3);
@@ -493,62 +447,57 @@ void driveForward(float distanceMm) {
       return;
     }
 
-    // Calculate target velocity (slow down near end)
-    float maxVel = TARGET_VELOCITY;
-    // Deceleration zone: slow down when close
-    float decelDist = 100.0;  // Start slowing 100mm from target
-    if (distRemaining < decelDist) {
-      maxVel = TARGET_VELOCITY * (distRemaining / decelDist);
-      maxVel = max(maxVel, 30.0);  // Minimum creep speed
-    }
+    // === OUTER LOOP: Position PID → Target Velocity ===
+    posIntegral += posError * dt;
+    posIntegral = constrain(posIntegral, -POS_INTEGRAL_MAX, POS_INTEGRAL_MAX);
+    float posDerivative = (posError - posLastError) / dt;
+    posLastError = posError;
 
-    // Ramp up/down target velocity
-    if (currentTargetVel < maxVel) {
-      currentTargetVel += VELOCITY_RAMP * dt;
-      if (currentTargetVel > maxVel) currentTargetVel = maxVel;
-    } else if (currentTargetVel > maxVel) {
-      currentTargetVel -= VELOCITY_RAMP * dt;
-      if (currentTargetVel < maxVel) currentTargetVel = maxVel;
-    }
+    float targetVel = POS_Kp * posError + POS_Ki * posIntegral + POS_Kd * posDerivative;
+    targetVel = constrain(targetVel, -MAX_VELOCITY, MAX_VELOCITY);
 
-    // Heading correction (differential velocity)
-    float headingError = getHeadingError();
-    float velCorrection = headingError * HEADING_Kp;
+    // Add heading correction as differential velocity
+    float hdgCorrection = getHeadingError() * HEADING_Kp;
+    float targetVelL = targetVel + hdgCorrection;
+    float targetVelR = targetVel - hdgCorrection;
 
-    float targetVelLeft = currentTargetVel + velCorrection;
-    float targetVelRight = currentTargetVel - velCorrection;
+    // === INNER LOOP: Adaptive Feedforward + P correction ===
+    float pwmL = kffLeft * targetVelL;
+    float pwmR = kffRight * targetVelR;
 
-    // Ensure minimum velocity when moving (to overcome deadband)
-    const float MIN_TARGET_VEL = 50.0;
-    if (targetVelLeft > 0 && targetVelLeft < MIN_TARGET_VEL) targetVelLeft = MIN_TARGET_VEL;
-    if (targetVelLeft < 0 && targetVelLeft > -MIN_TARGET_VEL) targetVelLeft = -MIN_TARGET_VEL;
-    if (targetVelRight > 0 && targetVelRight < MIN_TARGET_VEL) targetVelRight = MIN_TARGET_VEL;
-    if (targetVelRight < 0 && targetVelRight > -MIN_TARGET_VEL) targetVelRight = -MIN_TARGET_VEL;
-
-    // Adaptive feedforward: PWM = kff * targetVelocity
-    float pwmL = kffLeft * targetVelLeft;
-    float pwmR = kffRight * targetVelRight;
-
-    // Small correction based on velocity error
-    float velErrorL = targetVelLeft - velLeft;
-    float velErrorR = targetVelRight - velRight;
-    pwmL += velErrorL * 0.25;  // Small proportional correction
-    pwmR += velErrorR * 0.25;
+    // Small P correction on velocity error
+    float velErrorL = targetVelL - velLeft;
+    float velErrorR = targetVelR - velRight;
+    pwmL += VEL_Kp * velErrorL;
+    pwmR += VEL_Kp * velErrorR;
 
     pwmL = constrain(pwmL, -MAX_PWM, MAX_PWM);
     pwmR = constrain(pwmR, -MAX_PWM, MAX_PWM);
 
     drive((int)pwmL, (int)pwmR);
 
-    // Debug output for visualizer
+    // Update adaptive feedforward
+    const float MIN_VEL = 20.0;
+    if (abs(velLeft) > MIN_VEL && abs(pwmL) > MIN_PWM) {
+      float ratioL = abs(pwmL) / abs(velLeft);
+      kffLeft += ADAPT_RATE * (ratioL - kffLeft);
+      kffLeft = constrain(kffLeft, 0.3, 2.0);
+    }
+    if (abs(velRight) > MIN_VEL && abs(pwmR) > MIN_PWM) {
+      float ratioR = abs(pwmR) / abs(velRight);
+      kffRight += ADAPT_RATE * (ratioR - kffRight);
+      kffRight = constrain(kffRight, 0.3, 2.0);
+    }
+
+    // Debug output
     Serial.print("hdg:");
     Serial.print(heading, 1);
     Serial.print(" tgtHdg:");
     Serial.print(targetHeading);
-    Serial.print(" tgtVelL:");
-    Serial.print(targetVelLeft, 1);
-    Serial.print(" tgtVelR:");
-    Serial.print(targetVelRight, 1);
+    Serial.print(" dist:");
+    Serial.print(distTraveled, 1);
+    Serial.print(" tgtVel:");
+    Serial.print(targetVel, 1);
     Serial.print(" velL:");
     Serial.print(velLeft, 1);
     Serial.print(" velR:");
@@ -557,13 +506,10 @@ void driveForward(float distanceMm) {
     Serial.print((int)pwmL);
     Serial.print(" pwmR:");
     Serial.print((int)pwmR);
-    Serial.print(" ffL:");
-    Serial.print(kffLeft * targetVelLeft, 1);
-    Serial.print(" ffR:");
-    Serial.println(kffRight * targetVelRight, 1);
-
-    // Update adaptive coefficients
-    updateAdaptive(velLeft, velRight, pwmL, pwmR);
+    Serial.print(" kffL:");
+    Serial.print(kffLeft, 2);
+    Serial.print(" kffR:");
+    Serial.println(kffRight, 2);
 
     delay(SAMPLE_INTERVAL_MS);
   }
@@ -581,15 +527,18 @@ void driveBackward(float distanceMm) {
   long lastRight = startRight;
   interrupts();
 
+  // Position PID state
+  float posIntegral = 0;
+  float posLastError = 0;
+
   unsigned long lastTime = millis();
-  float currentTargetVel = 0;
-  int settleCount = 0;
 
   while (true) {
     updateIMU();
 
     unsigned long now = millis();
     float dt = (now - lastTime) / 1000.0;
+    if (dt < 0.001) dt = 0.001;
     lastTime = now;
 
     noInterrupts();
@@ -601,7 +550,6 @@ void driveBackward(float distanceMm) {
     float distLeft = (startLeft - left) * MM_PER_COUNT;
     float distRight = (startRight - right) * MM_PER_COUNT;
     float distTraveled = (distLeft + distRight) / 2.0;
-    float distRemaining = distanceMm - distTraveled;
 
     // Calculate actual velocities
     float velLeft = (left - lastLeft) * MM_PER_COUNT / dt;
@@ -609,8 +557,11 @@ void driveBackward(float distanceMm) {
     lastLeft = left;
     lastRight = right;
 
+    // Position error
+    float posError = distanceMm - distTraveled;
+
     // Check if done
-    if (distRemaining <= 0) {
+    if (posError < DISTANCE_TOLERANCE) {
       stop();
       Serial.print("Done. kffL=");
       Serial.print(kffLeft, 3);
@@ -619,61 +570,58 @@ void driveBackward(float distanceMm) {
       return;
     }
 
-    // Calculate target velocity (negative for backward)
-    float maxVel = TARGET_VELOCITY;
-    float decelDist = 100.0;
-    if (distRemaining < decelDist) {
-      maxVel = TARGET_VELOCITY * (distRemaining / decelDist);
-      maxVel = max(maxVel, 30.0);
-    }
+    // === OUTER LOOP: Position PID → Target Velocity (negative for backward) ===
+    posIntegral += posError * dt;
+    posIntegral = constrain(posIntegral, -POS_INTEGRAL_MAX, POS_INTEGRAL_MAX);
+    float posDerivative = (posError - posLastError) / dt;
+    posLastError = posError;
 
-    if (currentTargetVel < maxVel) {
-      currentTargetVel += VELOCITY_RAMP * dt;
-      if (currentTargetVel > maxVel) currentTargetVel = maxVel;
-    } else if (currentTargetVel > maxVel) {
-      currentTargetVel -= VELOCITY_RAMP * dt;
-      if (currentTargetVel < maxVel) currentTargetVel = maxVel;
-    }
+    float targetVel = POS_Kp * posError + POS_Ki * posIntegral + POS_Kd * posDerivative;
+    targetVel = constrain(targetVel, -MAX_VELOCITY, MAX_VELOCITY);
+    targetVel = -targetVel;  // Negate for backward
 
-    // Heading correction
-    float headingError = getHeadingError();
-    float velCorrection = headingError * HEADING_Kp;
+    // Add heading correction as differential velocity
+    float hdgCorrection = getHeadingError() * HEADING_Kp;
+    float targetVelL = targetVel + hdgCorrection;
+    float targetVelR = targetVel - hdgCorrection;
 
-    // Negative velocity for backward
-    float targetVelLeft = -currentTargetVel + velCorrection;
-    float targetVelRight = -currentTargetVel - velCorrection;
+    // === INNER LOOP: Adaptive Feedforward + P correction ===
+    float pwmL = kffLeft * targetVelL;
+    float pwmR = kffRight * targetVelR;
 
-    // Ensure minimum velocity when moving (to overcome deadband)
-    const float MIN_TARGET_VEL = 50.0;
-    if (targetVelLeft > 0 && targetVelLeft < MIN_TARGET_VEL) targetVelLeft = MIN_TARGET_VEL;
-    if (targetVelLeft < 0 && targetVelLeft > -MIN_TARGET_VEL) targetVelLeft = -MIN_TARGET_VEL;
-    if (targetVelRight > 0 && targetVelRight < MIN_TARGET_VEL) targetVelRight = MIN_TARGET_VEL;
-    if (targetVelRight < 0 && targetVelRight > -MIN_TARGET_VEL) targetVelRight = -MIN_TARGET_VEL;
-
-    // Adaptive feedforward
-    float pwmL = kffLeft * targetVelLeft;
-    float pwmR = kffRight * targetVelRight;
-
-    // Small correction
-    float velErrorL = targetVelLeft - velLeft;
-    float velErrorR = targetVelRight - velRight;
-    pwmL += velErrorL * 0.25;
-    pwmR += velErrorR * 0.25;
+    // Small P correction on velocity error
+    float velErrorL = targetVelL - velLeft;
+    float velErrorR = targetVelR - velRight;
+    pwmL += VEL_Kp * velErrorL;
+    pwmR += VEL_Kp * velErrorR;
 
     pwmL = constrain(pwmL, -MAX_PWM, MAX_PWM);
     pwmR = constrain(pwmR, -MAX_PWM, MAX_PWM);
 
     drive((int)pwmL, (int)pwmR);
 
-    // Debug output for visualizer
+    // Update adaptive feedforward
+    const float MIN_VEL = 20.0;
+    if (abs(velLeft) > MIN_VEL && abs(pwmL) > MIN_PWM) {
+      float ratioL = abs(pwmL) / abs(velLeft);
+      kffLeft += ADAPT_RATE * (ratioL - kffLeft);
+      kffLeft = constrain(kffLeft, 0.3, 2.0);
+    }
+    if (abs(velRight) > MIN_VEL && abs(pwmR) > MIN_PWM) {
+      float ratioR = abs(pwmR) / abs(velRight);
+      kffRight += ADAPT_RATE * (ratioR - kffRight);
+      kffRight = constrain(kffRight, 0.3, 2.0);
+    }
+
+    // Debug output
     Serial.print("hdg:");
     Serial.print(heading, 1);
     Serial.print(" tgtHdg:");
     Serial.print(targetHeading);
-    Serial.print(" tgtVelL:");
-    Serial.print(targetVelLeft, 1);
-    Serial.print(" tgtVelR:");
-    Serial.print(targetVelRight, 1);
+    Serial.print(" dist:");
+    Serial.print(distTraveled, 1);
+    Serial.print(" tgtVel:");
+    Serial.print(targetVel, 1);
     Serial.print(" velL:");
     Serial.print(velLeft, 1);
     Serial.print(" velR:");
@@ -682,13 +630,10 @@ void driveBackward(float distanceMm) {
     Serial.print((int)pwmL);
     Serial.print(" pwmR:");
     Serial.print((int)pwmR);
-    Serial.print(" ffL:");
-    Serial.print(kffLeft * targetVelLeft, 1);
-    Serial.print(" ffR:");
-    Serial.println(kffRight * targetVelRight, 1);
-
-    // Update adaptive (use absolute values for learning)
-    updateAdaptive(velLeft, velRight, pwmL, pwmR);
+    Serial.print(" kffL:");
+    Serial.print(kffLeft, 2);
+    Serial.print(" kffR:");
+    Serial.println(kffRight, 2);
 
     delay(SAMPLE_INTERVAL_MS);
   }
@@ -789,7 +734,8 @@ void runSequence(const char* seq) {
   headingOffset = heading + headingOffset;
   heading = 0;
   targetHeading = 0;
-  resetAdaptive();
+  kffLeft = INITIAL_KFF;
+  kffRight = INITIAL_KFF;
 
   for (int i = 0; seq[i] != '\0'; i++) {
     char cmd = seq[i];
@@ -825,10 +771,6 @@ void runSequence(const char* seq) {
   }
 
   Serial.println("Sequence complete!");
-  Serial.print("Final kffL=");
-  Serial.print(kffLeft, 3);
-  Serial.print(" kffR=");
-  Serial.println(kffRight, 3);
 }
 
 // ============== MAIN ==============
@@ -845,16 +787,16 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   stop();
-  resetAdaptive();
 
-  Serial.println("Simple Sequence + Adaptive Velocity (BNO085)");
+  Serial.println("Cascaded PID Controller (BNO085)");
   Serial.print("Sequence: ");
   Serial.println(SEQUENCE);
   Serial.print("Drive distance: ");
   Serial.print(DRIVE_DISTANCE);
   Serial.println(" mm");
-  Serial.print("Initial kff: ");
-  Serial.println(INITIAL_KFF);
+  Serial.print("Max velocity: ");
+  Serial.print(MAX_VELOCITY);
+  Serial.println(" mm/s");
   Serial.println("Press button 4 to run");
 }
 
