@@ -102,14 +102,7 @@ int16_t bnoReceivePacket() {
   // Read header + payload in one request (up to 32 bytes - Wire buffer limit)
   uint8_t bytesRead = Wire.requestFrom(BNO085_ADDR, (uint8_t)32);
 
-  if (bytesRead == 0) {
-    Serial.println(F("I2C:0"));
-    return -1;  // No response at all - I2C issue
-  }
-
-  if (Wire.available() < 4) {
-    Serial.print(F("Short:"));
-    Serial.println(Wire.available());
+  if (bytesRead == 0 || Wire.available() < 4) {
     return -1;
   }
 
@@ -117,15 +110,10 @@ int16_t bnoReceivePacket() {
   uint8_t lenMSB = Wire.read();
   uint8_t channel = Wire.read();
   uint8_t seqNum = Wire.read();
-  (void)seqNum;  // Unused
+  (void)seqNum;
 
   uint16_t totalLen = ((uint16_t)(lenMSB & 0x7F) << 8) | lenLSB;
-
-  if (totalLen == 0 || totalLen == 0x7FFF) {
-    Serial.print(F("BadLen:"));
-    Serial.println(totalLen, HEX);
-    return -1;
-  }
+  if (totalLen == 0 || totalLen == 0x7FFF) return -1;
 
   uint16_t dataLen = totalLen - 4;
   if (dataLen > sizeof(shtpBuffer)) dataLen = sizeof(shtpBuffer);
@@ -171,35 +159,48 @@ bool bnoUpdate() {
   uint8_t channel = result >> 8;
   uint8_t dataLen = result & 0xFF;
 
-  // Debug: show what we got
-  Serial.print(F("ch:"));
-  Serial.print(channel);
-  Serial.print(F(" len:"));
-  Serial.print(dataLen);
-  Serial.print(F(" id:"));
-  Serial.println(shtpBuffer[0], HEX);
-
   // Only parse input reports on channel 3
   if (channel != BNO_CHANNEL_REPORTS) return false;
 
-  // Check for game rotation vector report
-  if (shtpBuffer[0] != GAME_ROTATION_VECTOR) return false;
+  // Search for game rotation vector report in the packet
+  // Reports may be preceded by timestamp reference (0xFB)
+  uint8_t offset = 0;
+  while (offset < dataLen) {
+    uint8_t reportId = shtpBuffer[offset];
 
-  // Parse quaternion (Q14 fixed point, bytes 5-12)
-  // Format: i, j, k, real - each 2 bytes little-endian
-  int16_t qi = (int16_t)((shtpBuffer[6] << 8) | shtpBuffer[5]);
-  int16_t qj = (int16_t)((shtpBuffer[8] << 8) | shtpBuffer[7]);
-  int16_t qk = (int16_t)((shtpBuffer[10] << 8) | shtpBuffer[9]);
-  int16_t qr = (int16_t)((shtpBuffer[12] << 8) | shtpBuffer[11]);
+    if (reportId == GAME_ROTATION_VECTOR) {
+      // Found it! Parse quaternion at offset+4 (skip report header)
+      // Format: reportId(1), seq(1), status(1), delay(2), i(2), j(2), k(2), real(2)
+      uint8_t base = offset + 5;  // Skip to quaternion data
 
-  // Convert from Q14 to float
-  const float Q14_SCALE = 1.0f / 16384.0f;
-  quat[0] = qi * Q14_SCALE;  // i
-  quat[1] = qj * Q14_SCALE;  // j
-  quat[2] = qk * Q14_SCALE;  // k
-  quat[3] = qr * Q14_SCALE;  // real
+      int16_t qi = (int16_t)((shtpBuffer[base + 1] << 8) | shtpBuffer[base]);
+      int16_t qj = (int16_t)((shtpBuffer[base + 3] << 8) | shtpBuffer[base + 2]);
+      int16_t qk = (int16_t)((shtpBuffer[base + 5] << 8) | shtpBuffer[base + 4]);
+      int16_t qr = (int16_t)((shtpBuffer[base + 7] << 8) | shtpBuffer[base + 6]);
 
-  return true;
+      const float Q14_SCALE = 1.0f / 16384.0f;
+      quat[0] = qi * Q14_SCALE;
+      quat[1] = qj * Q14_SCALE;
+      quat[2] = qk * Q14_SCALE;
+      quat[3] = qr * Q14_SCALE;
+
+      return true;
+    }
+    else if (reportId == 0xFB) {
+      // Base timestamp reference - 5 bytes, skip it
+      offset += 5;
+    }
+    else if (reportId == 0xFC) {
+      // Timestamp rebase - 5 bytes, skip it
+      offset += 5;
+    }
+    else {
+      // Unknown report, try to skip (assume minimum 1 byte)
+      offset++;
+    }
+  }
+
+  return false;
 }
 
 bool bnoInit() {
@@ -214,32 +215,20 @@ bool bnoInit() {
   digitalWrite(BNO085_RST_PIN, HIGH);
   delay(500);  // Wait for boot - BNO085 needs time
 
-  Serial.println(F("Flushing..."));
-
   // Flush any pending data
   for (int i = 0; i < 20; i++) {
-    int16_t r = bnoReceivePacket();
-    Serial.print(i);
-    Serial.print(F(":"));
-    Serial.println(r, HEX);
+    bnoReceivePacket();
     delay(20);
   }
-
-  Serial.println(F("Enabling GRV..."));
 
   // Enable game rotation vector at 100Hz
   bnoEnableGameRotation(10);
   delay(100);
 
-  Serial.println(F("Waiting for data..."));
-
   // Wait for first valid reading
   unsigned long start = millis();
   while (millis() - start < 2000) {
-    if (bnoUpdate()) {
-      Serial.println(F("Got data!"));
-      return true;
-    }
+    if (bnoUpdate()) return true;
     delay(10);
   }
 
@@ -381,8 +370,9 @@ float getHeadingError() {
 }
 
 void driveForward(float distanceMm) {
-  Serial.print(F("Fwd "));
-  Serial.println((int)distanceMm);
+  Serial.print(F("Forward "));
+  Serial.print((int)distanceMm);
+  Serial.println(F(" mm"));
 
   noInterrupts();
   long startLeft = encLeft;
@@ -418,6 +408,7 @@ void driveForward(float distanceMm) {
 
     if (distRemaining <= 0) {
       stop();
+      Serial.println(F("Done"));
       return;
     }
 
@@ -452,6 +443,28 @@ void driveForward(float distanceMm) {
     pwmL = constrain(pwmL, -MAX_PWM, MAX_PWM);
     pwmR = constrain(pwmR, -MAX_PWM, MAX_PWM);
 
+    // Output for visualizer
+    Serial.print(F("hdg:"));
+    Serial.print(heading, 1);
+    Serial.print(F(" tgtHdg:"));
+    Serial.print(targetHeading);
+    Serial.print(F(" tgtVelL:"));
+    Serial.print(targetVelLeft, 1);
+    Serial.print(F(" tgtVelR:"));
+    Serial.print(targetVelRight, 1);
+    Serial.print(F(" velL:"));
+    Serial.print(velLeft, 1);
+    Serial.print(F(" velR:"));
+    Serial.print(velRight, 1);
+    Serial.print(F(" pwmL:"));
+    Serial.print((int)pwmL);
+    Serial.print(F(" pwmR:"));
+    Serial.print((int)pwmR);
+    Serial.print(F(" ffL:"));
+    Serial.print(KFF * targetVelLeft, 1);
+    Serial.print(F(" ffR:"));
+    Serial.println(KFF * targetVelRight, 1);
+
     drive((int)pwmL, (int)pwmR);
 
     delay(SAMPLE_INTERVAL_MS);
@@ -459,8 +472,9 @@ void driveForward(float distanceMm) {
 }
 
 void driveBackward(float distanceMm) {
-  Serial.print(F("Back "));
-  Serial.println((int)distanceMm);
+  Serial.print(F("Backward "));
+  Serial.print((int)distanceMm);
+  Serial.println(F(" mm"));
 
   noInterrupts();
   long startLeft = encLeft;
@@ -496,6 +510,7 @@ void driveBackward(float distanceMm) {
 
     if (distRemaining <= 0) {
       stop();
+      Serial.println(F("Done"));
       return;
     }
 
@@ -530,6 +545,28 @@ void driveBackward(float distanceMm) {
     pwmL = constrain(pwmL, -MAX_PWM, MAX_PWM);
     pwmR = constrain(pwmR, -MAX_PWM, MAX_PWM);
 
+    // Output for visualizer
+    Serial.print(F("hdg:"));
+    Serial.print(heading, 1);
+    Serial.print(F(" tgtHdg:"));
+    Serial.print(targetHeading);
+    Serial.print(F(" tgtVelL:"));
+    Serial.print(targetVelLeft, 1);
+    Serial.print(F(" tgtVelR:"));
+    Serial.print(targetVelRight, 1);
+    Serial.print(F(" velL:"));
+    Serial.print(velLeft, 1);
+    Serial.print(F(" velR:"));
+    Serial.print(velRight, 1);
+    Serial.print(F(" pwmL:"));
+    Serial.print((int)pwmL);
+    Serial.print(F(" pwmR:"));
+    Serial.print((int)pwmR);
+    Serial.print(F(" ffL:"));
+    Serial.print(KFF * targetVelLeft, 1);
+    Serial.print(F(" ffR:"));
+    Serial.println(KFF * targetVelRight, 1);
+
     drive((int)pwmL, (int)pwmR);
 
     delay(SAMPLE_INTERVAL_MS);
@@ -537,7 +574,7 @@ void driveBackward(float distanceMm) {
 }
 
 void turnLeft() {
-  Serial.println(F("Left 90"));
+  Serial.println(F("Turn left 90"));
   targetHeading += 90;
   if (targetHeading >= 360) targetHeading -= 360;
 
@@ -551,6 +588,7 @@ void turnLeft() {
       delay(100);
       updateIMU();
       if (abs(getHeadingError()) < HEADING_TOLERANCE) {
+        Serial.println(F("Done"));
         return;
       }
     }
@@ -564,6 +602,18 @@ void turnLeft() {
     pwmL = constrain(pwmL, -MAX_PWM, MAX_PWM);
     pwmR = constrain(pwmR, -MAX_PWM, MAX_PWM);
 
+    // Output for visualizer
+    Serial.print(F("hdg:"));
+    Serial.print(heading, 1);
+    Serial.print(F(" tgtHdg:"));
+    Serial.print(targetHeading);
+    Serial.print(F(" turnVel:"));
+    Serial.print(targetTurnVel, 1);
+    Serial.print(F(" pwmL:"));
+    Serial.print((int)pwmL);
+    Serial.print(F(" pwmR:"));
+    Serial.println((int)pwmR);
+
     drive((int)pwmL, (int)pwmR);
 
     delay(SAMPLE_INTERVAL_MS);
@@ -571,7 +621,7 @@ void turnLeft() {
 }
 
 void turnRight() {
-  Serial.println(F("Right 90"));
+  Serial.println(F("Turn right 90"));
   targetHeading -= 90;
   if (targetHeading < 0) targetHeading += 360;
 
@@ -585,6 +635,7 @@ void turnRight() {
       delay(100);
       updateIMU();
       if (abs(getHeadingError()) < HEADING_TOLERANCE) {
+        Serial.println(F("Done"));
         return;
       }
     }
@@ -597,6 +648,18 @@ void turnRight() {
 
     pwmL = constrain(pwmL, -MAX_PWM, MAX_PWM);
     pwmR = constrain(pwmR, -MAX_PWM, MAX_PWM);
+
+    // Output for visualizer
+    Serial.print(F("hdg:"));
+    Serial.print(heading, 1);
+    Serial.print(F(" tgtHdg:"));
+    Serial.print(targetHeading);
+    Serial.print(F(" turnVel:"));
+    Serial.print(targetTurnVel, 1);
+    Serial.print(F(" pwmL:"));
+    Serial.print((int)pwmL);
+    Serial.print(F(" pwmR:"));
+    Serial.println((int)pwmR);
 
     drive((int)pwmL, (int)pwmR);
 
@@ -637,32 +700,24 @@ int lastButtonVal = HIGH;
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-  Serial.println(F("I2C Scanner"));
 
-  Wire.begin();
+  setupMotors();
+  setupEncoders();
+  setupIMU();
 
-  // Reset BNO085
-  pinMode(BNO085_RST_PIN, OUTPUT);
-  digitalWrite(BNO085_RST_PIN, LOW);
-  delay(15);
-  digitalWrite(BNO085_RST_PIN, HIGH);
-  delay(500);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  stop();
 
-  Serial.println(F("Scanning..."));
-
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    Wire.beginTransmission(addr);
-    uint8_t error = Wire.endTransmission();
-    if (error == 0) {
-      Serial.print(F("Found: 0x"));
-      Serial.println(addr, HEX);
-    }
-  }
-
-  Serial.println(F("Done scanning"));
+  Serial.println(F("Ready - btn 4"));
 }
 
 void loop() {
-  delay(1000);
+  int buttonVal = digitalRead(BUTTON_PIN);
+
+  if (lastButtonVal == HIGH && buttonVal == LOW) {
+    delay(50);
+    runSequence(SEQUENCE);
+  }
+
+  lastButtonVal = buttonVal;
 }
