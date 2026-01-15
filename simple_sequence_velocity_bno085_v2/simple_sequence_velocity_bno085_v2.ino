@@ -68,8 +68,8 @@ const int SAMPLE_INTERVAL_MS = 10;     // Control loop interval
 
 // Heading control
 const float HEADING_Kp = 3.0;          // Heading correction during straights
-const float TURN_Kp = 2.0;             // Turn speed control
-const float TURN_VELOCITY = 100.0;     // Max turn velocity (mm/s)
+const float TURN_Kp = 5.0;             // Turn speed control
+const float TURN_VELOCITY = 250.0;     // Max turn velocity (mm/s)
 
 // Tolerances
 const float HEADING_TOLERANCE = 2.0;   // degrees
