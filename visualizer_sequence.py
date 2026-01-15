@@ -38,6 +38,8 @@ def find_arduino_port():
 current_move = "Idle"
 move_target = 0
 move_progress = 0
+
+# Heading tracking
 current_heading = 0
 target_heading = 0
 
@@ -105,13 +107,24 @@ def parse_move_done(line):
         return True
     return False
 
+def parse_heading(line):
+    """Parse heading data"""
+    global current_heading, target_heading
+
+    match = re.search(r'hdg:\s*([-\d.]+)\s*tgtHdg:\s*([-\d.]+)', line)
+    if match:
+        current_heading = float(match.group(1))
+        target_heading = float(match.group(2))
+        return True
+    return False
+
 def parse_velocity(line):
     """Parse velocity data"""
     global current_vel_left, current_vel_right, current_target_vel_left, current_target_vel_right
     global current_pwm_left, current_pwm_right, current_ff_left, current_ff_right, time_counter
     global move_progress
 
-    # Match: tgtVelL:X tgtVelR:Y velL:Z velR:W pwmL:A pwmR:B ffL:C ffR:D
+    # Match: hdg:X tgtHdg:Y tgtVelL:X tgtVelR:Y velL:Z velR:W pwmL:A pwmR:B ffL:C ffR:D
     match = re.search(r'tgtVelL:\s*([-\d.]+)\s*tgtVelR:\s*([-\d.]+)\s*velL:\s*([-\d.]+)\s*velR:\s*([-\d.]+)\s*pwmL:\s*([-\d.]+)\s*pwmR:\s*([-\d.]+)\s*ffL:\s*([-\d.]+)\s*ffR:\s*([-\d.]+)', line)
     if match:
         current_target_vel_left = float(match.group(1))
@@ -272,6 +285,7 @@ def update(frame):
                     print(line)  # Echo to console
                     parse_move_start(line)
                     parse_move_done(line)
+                    parse_heading(line)
                     parse_velocity(line)
                     kff_result = parse_kff(line)
                     if kff_result:
@@ -308,8 +322,13 @@ def update(frame):
     ax_move.add_patch(plt.Rectangle((0.1, 0.35), 0.8 * (progress_pct / 100), 0.15,
                                      fill=True, facecolor=color, alpha=0.7))
 
+    # Heading display
+    ax_move.text(0.5, 0.2, f"Heading: {current_heading:.1f}° / {target_heading:.0f}°",
+                 ha='center', va='center', fontsize=11, fontfamily='monospace',
+                 transform=ax_move.transAxes)
+
     # Adaptive coefficient display
-    ax_move.text(0.5, 0.15, f"kffL: {kff_left:.3f}  |  kffR: {kff_right:.3f}",
+    ax_move.text(0.5, 0.08, f"kffL: {kff_left:.3f}  |  kffR: {kff_right:.3f}",
                  ha='center', va='center', fontsize=10, fontfamily='monospace',
                  transform=ax_move.transAxes)
 

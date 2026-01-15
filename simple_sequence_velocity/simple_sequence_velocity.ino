@@ -31,6 +31,10 @@ const int BUTTON_PIN = 4;
 
 // MPU6050
 const int MPU6050_ADDR = 0x68;
+const int MPU_INT_PIN = 2;  // Connect MPU6050 INT to Arduino pin 2
+
+// Gyro interrupt flag
+volatile bool gyroDataReady = false;
 
 // ============== CONFIGURATION ==============
 
@@ -45,7 +49,7 @@ const float MM_PER_COUNT = (PI * WHEEL_DIAMETER_MM) / COUNTS_PER_REV;
 // Velocity control
 const float TARGET_VELOCITY = 200.0;   // mm/s for straights
 const float TURN_VELOCITY = 100.0;     // mm/s for turns
-const float VELOCITY_RAMP = 50.0;      // mm/s^2 acceleration limit
+const float VELOCITY_RAMP = 150.0;     // mm/s^2 acceleration limit
 
 // Adaptive feedforward
 const float INITIAL_KFF = 0.8;         // Initial PWM per mm/s
@@ -133,40 +137,88 @@ void setupEncoders() {
 
 // ============== GYRO ==============
 
+void gyroISR() {
+  gyroDataReady = true;
+}
+
 void setupGyro() {
   Wire.begin();
 
+  // Wake up MPU6050
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(0x6B);
   Wire.write(0x00);
   Wire.endTransmission();
 
+  // Set gyro range ±250°/s
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(0x1B);
-  Wire.write(0x00);  // ±250°/s
+  Wire.write(0x00);
   Wire.endTransmission();
+
+  // Enable digital low-pass filter to reduce motor vibration noise
+  // Also sets gyro sample rate to 1kHz (with DLPF enabled)
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1A);  // CONFIG register
+  Wire.write(0x05);  // DLPF ~10Hz bandwidth (stronger vibration filtering)
+  Wire.endTransmission();
+
+  // Set sample rate divider: sample rate = 1kHz / (1 + divider)
+  // Divider = 9 gives 100Hz sample rate
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x19);  // SMPLRT_DIV register
+  Wire.write(9);     // 100Hz
+  Wire.endTransmission();
+
+  // Configure interrupt: active high, push-pull, clear on read
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x37);  // INT_PIN_CFG register
+  Wire.write(0x10);  // INT cleared on any read
+  Wire.endTransmission();
+
+  // Enable data ready interrupt
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x38);  // INT_ENABLE register
+  Wire.write(0x01);  // DATA_RDY_EN
+  Wire.endTransmission();
+
+  // Set up Arduino interrupt
+  pinMode(MPU_INT_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(MPU_INT_PIN), gyroISR, RISING);
 
   delay(100);
 
   // Calibrate
   Serial.println("Calibrating gyro...");
   long sum = 0;
-  for (int i = 0; i < 500; i++) {
-    Wire.beginTransmission(MPU6050_ADDR);
-    Wire.write(0x47);
-    Wire.endTransmission(false);
-    Wire.requestFrom(MPU6050_ADDR, 2, true);
-    sum += (int16_t)(Wire.read() << 8 | Wire.read());
-    delay(2);
+  int samples = 0;
+  unsigned long startCal = millis();
+  while (samples < 500 && millis() - startCal < 3000) {
+    if (gyroDataReady) {
+      gyroDataReady = false;
+      Wire.beginTransmission(MPU6050_ADDR);
+      Wire.write(0x47);
+      Wire.endTransmission(false);
+      Wire.requestFrom(MPU6050_ADDR, 2, true);
+      sum += (int16_t)(Wire.read() << 8 | Wire.read());
+      samples++;
+    }
   }
-  gyroBiasZ = sum / 500.0;
+  gyroBiasZ = sum / (float)samples;
   Serial.print("Gyro bias: ");
-  Serial.println(gyroBiasZ);
+  Serial.print(gyroBiasZ);
+  Serial.print(" (");
+  Serial.print(samples);
+  Serial.println(" samples)");
 
   lastGyroUpdate = micros();
 }
 
 void updateGyro() {
+  // Only read if new data is ready (interrupt-driven)
+  if (!gyroDataReady) return;
+  gyroDataReady = false;
+
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(0x47);
   Wire.endTransmission(false);
@@ -179,6 +231,13 @@ void updateGyro() {
 
   float gyroZ = -(raw - gyroBiasZ) / 131.0;  // °/s, inverted
   heading += gyroZ * dt;
+}
+
+// Call this in tight loops to process all pending gyro data
+void processGyro() {
+  while (gyroDataReady) {
+    updateGyro();
+  }
 }
 
 // ============== MOTORS ==============
@@ -332,18 +391,13 @@ void driveForward(float distanceMm) {
     lastRight = right;
 
     // Check if done
-    if (abs(distRemaining) < DISTANCE_TOLERANCE) {
-      settleCount++;
-      if (settleCount > 10) {
-        stop();
-        Serial.print("Done. kffL=");
-        Serial.print(kffLeft, 3);
-        Serial.print(" kffR=");
-        Serial.println(kffRight, 3);
-        return;
-      }
-    } else {
-      settleCount = 0;
+    if (distRemaining <= 0) {
+      stop();
+      Serial.print("Done. kffL=");
+      Serial.print(kffLeft, 3);
+      Serial.print(" kffR=");
+      Serial.println(kffRight, 3);
+      return;
     }
 
     // Calculate target velocity (slow down near end)
@@ -371,6 +425,13 @@ void driveForward(float distanceMm) {
     float targetVelLeft = currentTargetVel + velCorrection;
     float targetVelRight = currentTargetVel - velCorrection;
 
+    // Ensure minimum velocity when moving (to overcome deadband)
+    const float MIN_TARGET_VEL = 50.0;
+    if (targetVelLeft > 0 && targetVelLeft < MIN_TARGET_VEL) targetVelLeft = MIN_TARGET_VEL;
+    if (targetVelLeft < 0 && targetVelLeft > -MIN_TARGET_VEL) targetVelLeft = -MIN_TARGET_VEL;
+    if (targetVelRight > 0 && targetVelRight < MIN_TARGET_VEL) targetVelRight = MIN_TARGET_VEL;
+    if (targetVelRight < 0 && targetVelRight > -MIN_TARGET_VEL) targetVelRight = -MIN_TARGET_VEL;
+
     // Adaptive feedforward: PWM = kff * targetVelocity
     float pwmL = kffLeft * targetVelLeft;
     float pwmR = kffRight * targetVelRight;
@@ -387,7 +448,11 @@ void driveForward(float distanceMm) {
     drive((int)pwmL, (int)pwmR);
 
     // Debug output for visualizer
-    Serial.print("tgtVelL:");
+    Serial.print("hdg:");
+    Serial.print(heading, 1);
+    Serial.print(" tgtHdg:");
+    Serial.print(targetHeading);
+    Serial.print(" tgtVelL:");
     Serial.print(targetVelLeft, 1);
     Serial.print(" tgtVelR:");
     Serial.print(targetVelRight, 1);
@@ -452,18 +517,13 @@ void driveBackward(float distanceMm) {
     lastRight = right;
 
     // Check if done
-    if (abs(distRemaining) < DISTANCE_TOLERANCE) {
-      settleCount++;
-      if (settleCount > 10) {
-        stop();
-        Serial.print("Done. kffL=");
-        Serial.print(kffLeft, 3);
-        Serial.print(" kffR=");
-        Serial.println(kffRight, 3);
-        return;
-      }
-    } else {
-      settleCount = 0;
+    if (distRemaining <= 0) {
+      stop();
+      Serial.print("Done. kffL=");
+      Serial.print(kffLeft, 3);
+      Serial.print(" kffR=");
+      Serial.println(kffRight, 3);
+      return;
     }
 
     // Calculate target velocity (negative for backward)
@@ -490,6 +550,13 @@ void driveBackward(float distanceMm) {
     float targetVelLeft = -currentTargetVel + velCorrection;
     float targetVelRight = -currentTargetVel - velCorrection;
 
+    // Ensure minimum velocity when moving (to overcome deadband)
+    const float MIN_TARGET_VEL = 50.0;
+    if (targetVelLeft > 0 && targetVelLeft < MIN_TARGET_VEL) targetVelLeft = MIN_TARGET_VEL;
+    if (targetVelLeft < 0 && targetVelLeft > -MIN_TARGET_VEL) targetVelLeft = -MIN_TARGET_VEL;
+    if (targetVelRight > 0 && targetVelRight < MIN_TARGET_VEL) targetVelRight = MIN_TARGET_VEL;
+    if (targetVelRight < 0 && targetVelRight > -MIN_TARGET_VEL) targetVelRight = -MIN_TARGET_VEL;
+
     // Adaptive feedforward
     float pwmL = kffLeft * targetVelLeft;
     float pwmR = kffRight * targetVelRight;
@@ -506,7 +573,11 @@ void driveBackward(float distanceMm) {
     drive((int)pwmL, (int)pwmR);
 
     // Debug output for visualizer
-    Serial.print("tgtVelL:");
+    Serial.print("hdg:");
+    Serial.print(heading, 1);
+    Serial.print(" tgtHdg:");
+    Serial.print(targetHeading);
+    Serial.print(" tgtVelL:");
     Serial.print(targetVelLeft, 1);
     Serial.print(" tgtVelR:");
     Serial.print(targetVelRight, 1);
@@ -563,6 +634,12 @@ void turnLeft() {
 
     drive((int)pwmL, (int)pwmR);
 
+    // Debug output
+    Serial.print("hdg:");
+    Serial.print(heading, 1);
+    Serial.print(" tgtHdg:");
+    Serial.println(targetHeading);
+
     delay(SAMPLE_INTERVAL_MS);
   }
 }
@@ -597,6 +674,12 @@ void turnRight() {
     pwmR = constrain(pwmR, -MAX_PWM, MAX_PWM);
 
     drive((int)pwmL, (int)pwmR);
+
+    // Debug output
+    Serial.print("hdg:");
+    Serial.print(heading, 1);
+    Serial.print(" tgtHdg:");
+    Serial.println(targetHeading);
 
     delay(SAMPLE_INTERVAL_MS);
   }
@@ -680,6 +763,8 @@ void setup() {
   Serial.println("Press button 4 to run");
 }
 
+unsigned long lastIdleOutput = 0;
+
 void loop() {
   int buttonVal = digitalRead(BUTTON_PIN);
 
@@ -689,4 +774,14 @@ void loop() {
   }
 
   lastButtonVal = buttonVal;
+
+  // Periodic heading output when idle
+  if (millis() - lastIdleOutput > 100) {
+    updateGyro();
+    Serial.print("hdg:");
+    Serial.print(heading, 1);
+    Serial.print(" tgtHdg:");
+    Serial.println(targetHeading);
+    lastIdleOutput = millis();
+  }
 }
