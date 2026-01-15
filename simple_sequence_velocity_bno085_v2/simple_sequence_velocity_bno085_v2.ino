@@ -309,7 +309,7 @@ void setupIMU() {
 
   // Get initial heading as offset
   updateIMU();
-  headingOffset = heading;
+  headingOffset = headingOffset - heading;  // Set offset to current raw yaw
   heading = 0;
 }
 
@@ -815,7 +815,7 @@ void runSequence(const char* seq) {
 
   // Reset heading and adaptive coefficients
   updateIMU();
-  headingOffset = heading + headingOffset;
+  headingOffset = headingOffset - heading;  // Set offset to current raw yaw
   heading = 0;
   targetHeading = 0;
   kffLeft = INITIAL_KFF;
