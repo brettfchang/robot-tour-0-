@@ -489,15 +489,19 @@ void driveForward(float distanceMm) {
       kffRight = constrain(kffRight, 0.3, 2.0);
     }
 
-    // Debug output
+    // Debug output (visualizer format)
+    float ffL = kffLeft * targetVelL;
+    float ffR = kffRight * targetVelR;
     Serial.print("hdg:");
     Serial.print(heading, 1);
     Serial.print(" tgtHdg:");
     Serial.print(targetHeading);
     Serial.print(" dist:");
     Serial.print(distTraveled, 1);
-    Serial.print(" tgtVel:");
-    Serial.print(targetVel, 1);
+    Serial.print(" tgtVelL:");
+    Serial.print(targetVelL, 1);
+    Serial.print(" tgtVelR:");
+    Serial.print(targetVelR, 1);
     Serial.print(" velL:");
     Serial.print(velLeft, 1);
     Serial.print(" velR:");
@@ -506,10 +510,10 @@ void driveForward(float distanceMm) {
     Serial.print((int)pwmL);
     Serial.print(" pwmR:");
     Serial.print((int)pwmR);
-    Serial.print(" kffL:");
-    Serial.print(kffLeft, 2);
-    Serial.print(" kffR:");
-    Serial.println(kffRight, 2);
+    Serial.print(" ffL:");
+    Serial.print(ffL, 1);
+    Serial.print(" ffR:");
+    Serial.println(ffR, 1);
 
     delay(SAMPLE_INTERVAL_MS);
   }
@@ -613,15 +617,19 @@ void driveBackward(float distanceMm) {
       kffRight = constrain(kffRight, 0.3, 2.0);
     }
 
-    // Debug output
+    // Debug output (visualizer format)
+    float ffL = kffLeft * targetVelL;
+    float ffR = kffRight * targetVelR;
     Serial.print("hdg:");
     Serial.print(heading, 1);
     Serial.print(" tgtHdg:");
     Serial.print(targetHeading);
     Serial.print(" dist:");
     Serial.print(distTraveled, 1);
-    Serial.print(" tgtVel:");
-    Serial.print(targetVel, 1);
+    Serial.print(" tgtVelL:");
+    Serial.print(targetVelL, 1);
+    Serial.print(" tgtVelR:");
+    Serial.print(targetVelR, 1);
     Serial.print(" velL:");
     Serial.print(velLeft, 1);
     Serial.print(" velR:");
@@ -630,10 +638,10 @@ void driveBackward(float distanceMm) {
     Serial.print((int)pwmL);
     Serial.print(" pwmR:");
     Serial.print((int)pwmR);
-    Serial.print(" kffL:");
-    Serial.print(kffLeft, 2);
-    Serial.print(" kffR:");
-    Serial.println(kffRight, 2);
+    Serial.print(" ffL:");
+    Serial.print(ffL, 1);
+    Serial.print(" ffR:");
+    Serial.println(ffR, 1);
 
     delay(SAMPLE_INTERVAL_MS);
   }
@@ -644,8 +652,30 @@ void turnLeft() {
   targetHeading += 90;
   if (targetHeading >= 360) targetHeading -= 360;
 
+  noInterrupts();
+  long lastLeft = encLeft;
+  long lastRight = encRight;
+  interrupts();
+
+  unsigned long lastTime = millis();
+
   while (true) {
     updateIMU();
+
+    unsigned long now = millis();
+    float dt = (now - lastTime) / 1000.0;
+    if (dt < 0.001) dt = 0.001;
+    lastTime = now;
+
+    noInterrupts();
+    long left = encLeft;
+    long right = encRight;
+    interrupts();
+
+    float velLeft = (left - lastLeft) * MM_PER_COUNT / dt;
+    float velRight = (right - lastRight) * MM_PER_COUNT / dt;
+    lastLeft = left;
+    lastRight = right;
 
     float error = getHeadingError();
 
@@ -664,19 +694,35 @@ void turnLeft() {
     targetTurnVel = constrain(targetTurnVel, -TURN_VELOCITY, TURN_VELOCITY);
 
     // Left wheel forward, right wheel backward for left turn
-    float pwmL = kffLeft * targetTurnVel;
-    float pwmR = kffRight * (-targetTurnVel);
+    float ffL = kffLeft * targetTurnVel;
+    float ffR = kffRight * (-targetTurnVel);
+    float pwmL = ffL;
+    float pwmR = ffR;
 
     pwmL = constrain(pwmL, -MAX_PWM, MAX_PWM);
     pwmR = constrain(pwmR, -MAX_PWM, MAX_PWM);
 
     drive((int)pwmL, (int)pwmR);
 
-    // Debug output
+    // Debug output (visualizer format)
     Serial.print("hdg:");
     Serial.print(heading, 1);
     Serial.print(" tgtHdg:");
-    Serial.println(targetHeading);
+    Serial.print(targetHeading);
+    Serial.print(" turnVel:");
+    Serial.print(targetTurnVel, 1);
+    Serial.print(" velL:");
+    Serial.print(velLeft, 1);
+    Serial.print(" velR:");
+    Serial.print(velRight, 1);
+    Serial.print(" pwmL:");
+    Serial.print((int)pwmL);
+    Serial.print(" pwmR:");
+    Serial.print((int)pwmR);
+    Serial.print(" ffL:");
+    Serial.print(ffL, 1);
+    Serial.print(" ffR:");
+    Serial.println(ffR, 1);
 
     delay(SAMPLE_INTERVAL_MS);
   }
@@ -687,8 +733,30 @@ void turnRight() {
   targetHeading -= 90;
   if (targetHeading < 0) targetHeading += 360;
 
+  noInterrupts();
+  long lastLeft = encLeft;
+  long lastRight = encRight;
+  interrupts();
+
+  unsigned long lastTime = millis();
+
   while (true) {
     updateIMU();
+
+    unsigned long now = millis();
+    float dt = (now - lastTime) / 1000.0;
+    if (dt < 0.001) dt = 0.001;
+    lastTime = now;
+
+    noInterrupts();
+    long left = encLeft;
+    long right = encRight;
+    interrupts();
+
+    float velLeft = (left - lastLeft) * MM_PER_COUNT / dt;
+    float velRight = (right - lastRight) * MM_PER_COUNT / dt;
+    lastLeft = left;
+    lastRight = right;
 
     float error = getHeadingError();
 
@@ -705,19 +773,35 @@ void turnRight() {
     float targetTurnVel = error * TURN_Kp;
     targetTurnVel = constrain(targetTurnVel, -TURN_VELOCITY, TURN_VELOCITY);
 
-    float pwmL = kffLeft * targetTurnVel;
-    float pwmR = kffRight * (-targetTurnVel);
+    float ffL = kffLeft * targetTurnVel;
+    float ffR = kffRight * (-targetTurnVel);
+    float pwmL = ffL;
+    float pwmR = ffR;
 
     pwmL = constrain(pwmL, -MAX_PWM, MAX_PWM);
     pwmR = constrain(pwmR, -MAX_PWM, MAX_PWM);
 
     drive((int)pwmL, (int)pwmR);
 
-    // Debug output
+    // Debug output (visualizer format)
     Serial.print("hdg:");
     Serial.print(heading, 1);
     Serial.print(" tgtHdg:");
-    Serial.println(targetHeading);
+    Serial.print(targetHeading);
+    Serial.print(" turnVel:");
+    Serial.print(targetTurnVel, 1);
+    Serial.print(" velL:");
+    Serial.print(velLeft, 1);
+    Serial.print(" velR:");
+    Serial.print(velRight, 1);
+    Serial.print(" pwmL:");
+    Serial.print((int)pwmL);
+    Serial.print(" pwmR:");
+    Serial.print((int)pwmR);
+    Serial.print(" ffL:");
+    Serial.print(ffL, 1);
+    Serial.print(" ffR:");
+    Serial.println(ffR, 1);
 
     delay(SAMPLE_INTERVAL_MS);
   }
