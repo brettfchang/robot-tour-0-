@@ -208,6 +208,9 @@ void setup() {
   Serial.println();
 }
 
+unsigned long lastUpdate = 0;
+int missCount = 0;
+
 void loop() {
   if (bnoUpdate()) {
     float h = getHeading();
@@ -217,16 +220,16 @@ void loop() {
     if (abs(h) < 100) Serial.print(' ');
     if (abs(h) < 10) Serial.print(' ');
     Serial.print(h, 1);
-    Serial.print(F("  ["));
+    Serial.print(F(" dt="));
+    Serial.print(millis() - lastUpdate);
+    Serial.print(F(" miss="));
+    Serial.println(missCount);
 
-    int pos = map((int)h, -180, 180, 0, 20);
-    for (int i = 0; i < 20; i++) {
-      if (i == 10) Serial.print('|');
-      else if (i == pos) Serial.print('*');
-      else Serial.print('-');
-    }
-    Serial.println(F("]"));
+    lastUpdate = millis();
+    missCount = 0;
+  } else {
+    missCount++;
   }
 
-  delay(100);
+  delay(10);
 }
