@@ -47,14 +47,15 @@ const uint8_t BNO085_ADDR = 0x4A;
 // ============== CONFIGURATION ==============
 
 // Distance options (mm)
-const float DIST_250 = 250.0;
+const float DIST_250 = 330.0;
 const float DIST_500 = 500.0;
 const float DIST_1000 = 1000.0;
 const float DIST_1500 = 1500.0;
 const float DIST_2000 = 2000.0;
 
 // Speed scaling when carrying bottle
-const float BOTTLE_SPEED_SCALE = 0.5;
+const float BOTTLE_STRAIGHT_SCALE = 0.588;  // 1.7x slower (1/1.7)
+const float BOTTLE_TURN_SCALE = 0.5;        // 2x slower (1/2)
 
 // Robot measurements
 const float WHEEL_DIAMETER_MM = 73.025;
@@ -95,7 +96,7 @@ const int MAX_PWM = 255;
 //   Turns:    l=left 90°   r=right 90°
 //   Bottle:   p=pickup (slow mode ON)  d=drop (slow mode OFF)
 //
-const char* SEQUENCE = "2l1p2r2";  // Square: 500mm forward, right, x4
+const char* SEQUENCE = "1l2rp3d7l2l29rr2r4d7r4lp2r2d9r3r2";  // Square: 500mm forward, right, x4
 
 // ============== STATE ==============
 
@@ -475,7 +476,7 @@ void updatePositionAfterTurn(float dist, float avgHeading) {
 }
 
 void driveForward(float distanceMm) {
-  float speedScale = hasBottle ? BOTTLE_SPEED_SCALE : 1.0;
+  float speedScale = hasBottle ? BOTTLE_STRAIGHT_SCALE : 1.0;
   float maxVel = MAX_VELOCITY * speedScale;
 
   // Apply position correction
@@ -647,7 +648,7 @@ void driveForward(float distanceMm) {
 }
 
 void driveBackward(float distanceMm) {
-  float speedScale = hasBottle ? BOTTLE_SPEED_SCALE : 1.0;
+  float speedScale = hasBottle ? BOTTLE_STRAIGHT_SCALE : 1.0;
   float maxVel = MAX_VELOCITY * speedScale;
 
   // Apply position correction (negative because moving backward)
@@ -681,7 +682,10 @@ void driveBackward(float distanceMm) {
   float posLastError = adjustedDistance;  // Initialize to starting error to avoid derivative spike
 
   unsigned long lastTime = millis();
+  unsigned long lastMoveTime = millis();  // For stall detection
+  float lastDistTraveled = 0;
   float distTraveled = 0;
+  const unsigned long STALL_TIMEOUT_MS = 300;
 
   while (true) {
     updateIMU();
@@ -700,6 +704,22 @@ void driveBackward(float distanceMm) {
     float distLeft = (startLeft - left) * MM_PER_COUNT;
     float distRight = (startRight - right) * MM_PER_COUNT;
     distTraveled = (distLeft + distRight) / 2.0;
+
+    // Stall detection - check if robot has moved
+    if (abs(distTraveled - lastDistTraveled) > 1.0) {
+      lastMoveTime = now;  // Robot is moving
+      lastDistTraveled = distTraveled;
+    } else if (now - lastMoveTime > STALL_TIMEOUT_MS) {
+      // Stalled - no movement for 300ms
+      stop();
+      Serial.print("STALL! ");
+      updatePositionAfterMove(-distanceMm, -distTraveled, heading);
+      Serial.print("xErr:");
+      Serial.print(xPosError, 1);
+      Serial.print(" yErr:");
+      Serial.println(yPosError, 1);
+      return;
+    }
 
     // Calculate actual velocities
     float velLeft = (left - lastLeft) * MM_PER_COUNT / dt;
@@ -802,141 +822,10 @@ void driveBackward(float distanceMm) {
 }
 
 void turnLeft() {
-  float speedScale = hasBottle ? BOTTLE_SPEED_SCALE : 1.0;
+  float speedScale = hasBottle ? BOTTLE_TURN_SCALE : 1.0;
   float maxTurnVel = TURN_VELOCITY * speedScale;
 
   Serial.print("Turn left 90");
-  if (hasBottle) Serial.print(" [BOTTLE]");
-  Serial.println();
-
-  // Track starting heading for average calculation
-  float startHeading = heading;
-
-  targetHeading += 90;
-  if (targetHeading >= 360) targetHeading -= 360;
-
-  noInterrupts();
-  long startLeft = encLeft;
-  long startRight = encRight;
-  long lastLeft = startLeft;
-  long lastRight = startRight;
-  interrupts();
-
-  unsigned long lastTime = millis();
-  unsigned long startTime = millis();
-  const unsigned long TURN_TIMEOUT_MS = 2000;
-
-  while (true) {
-    updateIMU();
-
-    unsigned long now = millis();
-    float dt = (now - lastTime) / 1000.0;
-    if (dt < 0.001) dt = 0.001;
-    lastTime = now;
-
-    // Check for timeout
-    if (now - startTime > TURN_TIMEOUT_MS) {
-      stop();
-      Serial.print("TIMEOUT! ");
-      // Still update position tracking
-      noInterrupts();
-      long endLeft = encLeft;
-      long endRight = encRight;
-      interrupts();
-      float driftDist = ((endLeft - startLeft) + (endRight - startRight)) / 2.0 * MM_PER_COUNT;
-      float avgHeading = (startHeading + heading) / 2.0;
-      updatePositionAfterTurn(driftDist, avgHeading);
-      Serial.print("xErr:");
-      Serial.print(xPosError, 1);
-      Serial.print(" yErr:");
-      Serial.println(yPosError, 1);
-      return;
-    }
-
-    noInterrupts();
-    long left = encLeft;
-    long right = encRight;
-    interrupts();
-
-    float velLeft = (left - lastLeft) * MM_PER_COUNT / dt;
-    float velRight = (right - lastRight) * MM_PER_COUNT / dt;
-    lastLeft = left;
-    lastRight = right;
-
-    float error = getHeadingError();
-
-    if (abs(error) < HEADING_TOLERANCE) {
-      stop();
-      delay(100);
-      updateIMU();
-      if (abs(getHeadingError()) < HEADING_TOLERANCE) {
-        // Calculate any drift during turn
-        noInterrupts();
-        long endLeft = encLeft;
-        long endRight = encRight;
-        interrupts();
-        float driftDist = ((endLeft - startLeft) + (endRight - startRight)) / 2.0 * MM_PER_COUNT;
-        float avgHeading = (startHeading + heading) / 2.0;
-        updatePositionAfterTurn(driftDist, avgHeading);
-        Serial.print("Done. drift:");
-        Serial.print(driftDist, 1);
-        Serial.print(" xErr:");
-        Serial.print(xPosError, 1);
-        Serial.print(" yErr:");
-        Serial.print(yPosError, 1);
-        Serial.print(" pos:(");
-        Serial.print(actualX, 0);
-        Serial.print(",");
-        Serial.print(actualY, 0);
-        Serial.println(")");
-        return;
-      }
-    }
-
-    // Target turn velocity proportional to error
-    float targetTurnVel = error * TURN_Kp;
-    targetTurnVel = constrain(targetTurnVel, -maxTurnVel, maxTurnVel);
-
-    // Left wheel forward, right wheel backward for left turn
-    float ffL = kffLeft * targetTurnVel;
-    float ffR = kffRight * (-targetTurnVel);
-    float pwmL = ffL;
-    float pwmR = ffR;
-
-    pwmL = constrain(pwmL, -MAX_PWM, MAX_PWM);
-    pwmR = constrain(pwmR, -MAX_PWM, MAX_PWM);
-
-    drive((int)pwmL, (int)pwmR);
-
-    // Debug output (visualizer format)
-    Serial.print("hdg:");
-    Serial.print(heading, 1);
-    Serial.print(" tgtHdg:");
-    Serial.print(targetHeading);
-    Serial.print(" turnVel:");
-    Serial.print(targetTurnVel, 1);
-    Serial.print(" velL:");
-    Serial.print(velLeft, 1);
-    Serial.print(" velR:");
-    Serial.print(velRight, 1);
-    Serial.print(" pwmL:");
-    Serial.print((int)pwmL);
-    Serial.print(" pwmR:");
-    Serial.print((int)pwmR);
-    Serial.print(" ffL:");
-    Serial.print(ffL, 1);
-    Serial.print(" ffR:");
-    Serial.println(ffR, 1);
-
-    delay(SAMPLE_INTERVAL_MS);
-  }
-}
-
-void turnRight() {
-  float speedScale = hasBottle ? BOTTLE_SPEED_SCALE : 1.0;
-  float maxTurnVel = TURN_VELOCITY * speedScale;
-
-  Serial.print("Turn right 90");
   if (hasBottle) Serial.print(" [BOTTLE]");
   Serial.println();
 
@@ -1024,9 +913,141 @@ void turnRight() {
       }
     }
 
+    // Target turn velocity proportional to error
     float targetTurnVel = error * TURN_Kp;
     targetTurnVel = constrain(targetTurnVel, -maxTurnVel, maxTurnVel);
 
+    // Left wheel backward, right wheel forward for left turn
+    float ffL = kffLeft * targetTurnVel;
+    float ffR = kffRight * (-targetTurnVel);
+    float pwmL = ffL;
+    float pwmR = ffR;
+
+    pwmL = constrain(pwmL, -MAX_PWM, MAX_PWM);
+    pwmR = constrain(pwmR, -MAX_PWM, MAX_PWM);
+
+    drive((int)pwmL, (int)pwmR);
+
+    // Debug output (visualizer format)
+    Serial.print("hdg:");
+    Serial.print(heading, 1);
+    Serial.print(" tgtHdg:");
+    Serial.print(targetHeading);
+    Serial.print(" turnVel:");
+    Serial.print(targetTurnVel, 1);
+    Serial.print(" velL:");
+    Serial.print(velLeft, 1);
+    Serial.print(" velR:");
+    Serial.print(velRight, 1);
+    Serial.print(" pwmL:");
+    Serial.print((int)pwmL);
+    Serial.print(" pwmR:");
+    Serial.print((int)pwmR);
+    Serial.print(" ffL:");
+    Serial.print(ffL, 1);
+    Serial.print(" ffR:");
+    Serial.println(ffR, 1);
+
+    delay(SAMPLE_INTERVAL_MS);
+  }
+}
+
+void turnRight() {
+  float speedScale = hasBottle ? BOTTLE_TURN_SCALE : 1.0;
+  float maxTurnVel = TURN_VELOCITY * speedScale;
+
+  Serial.print("Turn right 90");
+  if (hasBottle) Serial.print(" [BOTTLE]");
+  Serial.println();
+
+  // Track starting heading for average calculation
+  float startHeading = heading;
+
+  targetHeading += 90;
+  if (targetHeading >= 360) targetHeading -= 360;
+
+  noInterrupts();
+  long startLeft = encLeft;
+  long startRight = encRight;
+  long lastLeft = startLeft;
+  long lastRight = startRight;
+  interrupts();
+
+  unsigned long lastTime = millis();
+  unsigned long startTime = millis();
+  const unsigned long TURN_TIMEOUT_MS = 2000;
+
+  while (true) {
+    updateIMU();
+
+    unsigned long now = millis();
+    float dt = (now - lastTime) / 1000.0;
+    if (dt < 0.001) dt = 0.001;
+    lastTime = now;
+
+    // Check for timeout
+    if (now - startTime > TURN_TIMEOUT_MS) {
+      stop();
+      Serial.print("TIMEOUT! ");
+      // Still update position tracking
+      noInterrupts();
+      long endLeft = encLeft;
+      long endRight = encRight;
+      interrupts();
+      float driftDist = ((endLeft - startLeft) + (endRight - startRight)) / 2.0 * MM_PER_COUNT;
+      float avgHeading = (startHeading + heading) / 2.0;
+      updatePositionAfterTurn(driftDist, avgHeading);
+      Serial.print("xErr:");
+      Serial.print(xPosError, 1);
+      Serial.print(" yErr:");
+      Serial.println(yPosError, 1);
+      return;
+    }
+
+    noInterrupts();
+    long left = encLeft;
+    long right = encRight;
+    interrupts();
+
+    float velLeft = (left - lastLeft) * MM_PER_COUNT / dt;
+    float velRight = (right - lastRight) * MM_PER_COUNT / dt;
+    lastLeft = left;
+    lastRight = right;
+
+    float error = getHeadingError();
+
+    if (abs(error) < HEADING_TOLERANCE) {
+      stop();
+      delay(100);
+      updateIMU();
+      if (abs(getHeadingError()) < HEADING_TOLERANCE) {
+        // Calculate any drift during turn
+        noInterrupts();
+        long endLeft = encLeft;
+        long endRight = encRight;
+        interrupts();
+        float driftDist = ((endLeft - startLeft) + (endRight - startRight)) / 2.0 * MM_PER_COUNT;
+        float avgHeading = (startHeading + heading) / 2.0;
+        updatePositionAfterTurn(driftDist, avgHeading);
+        Serial.print("Done. drift:");
+        Serial.print(driftDist, 1);
+        Serial.print(" xErr:");
+        Serial.print(xPosError, 1);
+        Serial.print(" yErr:");
+        Serial.print(yPosError, 1);
+        Serial.print(" pos:(");
+        Serial.print(actualX, 0);
+        Serial.print(",");
+        Serial.print(actualY, 0);
+        Serial.println(")");
+        return;
+      }
+    }
+
+    float targetTurnVel = error * TURN_Kp;
+    targetTurnVel = constrain(targetTurnVel, -maxTurnVel, maxTurnVel);
+
+    // Left wheel forward, right wheel backward for right turn
     float ffL = kffLeft * targetTurnVel;
     float ffR = kffRight * (-targetTurnVel);
     float pwmL = ffL;
@@ -1177,9 +1198,11 @@ void setup() {
   Serial.println(SEQUENCE);
   Serial.print("Max velocity: ");
   Serial.print(MAX_VELOCITY);
-  Serial.print(" mm/s (");
-  Serial.print(MAX_VELOCITY * BOTTLE_SPEED_SCALE);
-  Serial.println(" with bottle)");
+  Serial.print(" mm/s (bottle: ");
+  Serial.print(MAX_VELOCITY * BOTTLE_STRAIGHT_SCALE, 0);
+  Serial.print(" straight, ");
+  Serial.print(TURN_VELOCITY * BOTTLE_TURN_SCALE, 0);
+  Serial.println(" turn)");
   Serial.println("Press button 4 to run");
 }
 
